@@ -139,6 +139,7 @@ final class JSONRPCConnectionTests: XCTestCase {
         let firstStart = Task { try await connection.start() }
         await transport.waitForStartCalls(count: 1)
         let secondStart = Task { try await connection.start() }
+        try await waitForStartWaiters(on: connection, count: 1)
         await transport.terminate(code: 9)
 
         do {
@@ -147,7 +148,7 @@ final class JSONRPCConnectionTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? JSONRPCError, .disconnected)
         }
-        await transport.releaseStart()
+        await transport.releaseStart(error: .malformedMessage)
 
         do {
             try await firstStart.value
@@ -163,14 +164,11 @@ final class JSONRPCConnectionTests: XCTestCase {
 
         let first = Task { try await connection.start() }
         await transport.waitForStartCalls(count: 1)
-        let secondReturned = expectation(description: "second start returned before initial start was released")
-        secondReturned.isInverted = true
-        let second = Task {
-            try await connection.start()
-            secondReturned.fulfill()
-        }
+        let second = Task { try await connection.start() }
 
-        await fulfillment(of: [secondReturned], timeout: 0.05)
+        try await waitForStartWaiters(on: connection, count: 1)
+        let startWaiterCount = await connection.startWaiterCount
+        XCTAssertEqual(startWaiterCount, 1)
         await transport.releaseStart()
         try await first.value
         try await second.value
@@ -186,6 +184,7 @@ final class JSONRPCConnectionTests: XCTestCase {
         let first = Task { try await connection.start() }
         await transport.waitForStartCalls(count: 1)
         let second = Task { try await connection.start() }
+        try await waitForStartWaiters(on: connection, count: 1)
         await transport.releaseStart(error: .malformedMessage)
 
         for start in [first, second] {
@@ -245,6 +244,24 @@ private struct RecordedRequest: Sendable {
     let id: Int
     let method: String
     let params: JSONValue?
+}
+
+private enum StartWaitError: Error {
+    case timedOut
+}
+
+private func waitForStartWaiters(
+    on connection: JSONRPCConnection,
+    count: Int,
+    timeout: Duration = .seconds(1)
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while await connection.startWaiterCount < count {
+        guard clock.now < deadline else { throw StartWaitError.timedOut }
+        // This is condition polling with a deadline, not an assumed startup delay.
+        try await Task.sleep(for: .milliseconds(1))
+    }
 }
 
 private actor FakeRPCTransport: RPCTransport {

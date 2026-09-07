@@ -84,6 +84,7 @@ actor JSONRPCConnection: RPCConnecting {
     private(set) var onNotification: NotificationHandler?
 
     var pendingRequestCount: Int { pending.count }
+    var startWaiterCount: Int { startWaiters.count }
 
     init(transport: any RPCTransport) {
         self.transport = transport
@@ -116,10 +117,11 @@ actor JSONRPCConnection: RPCConnecting {
             isStarted = true
             finishStartWaiters(with: .success(()))
         } catch {
-            if lifecycleGeneration == generation {
-                isStarting = false
-                finishStartWaiters(with: .failure(error))
+            guard lifecycleGeneration == generation else {
+                throw JSONRPCError.disconnected
             }
+            isStarting = false
+            finishStartWaiters(with: .failure(error))
             throw error
         }
     }
