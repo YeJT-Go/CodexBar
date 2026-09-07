@@ -1,44 +1,44 @@
-# CodexBar Design
+# CodexBar 设计说明
 
-## Summary
+## 项目概述
 
-CodexBar is a self-use, native macOS menu bar application that shows the current remaining Codex quota for the five-hour and weekly windows. It targets the owner's Apple M1 Pro Mac running macOS 26.5 and uses the installed `codex-cli 0.147.0` as its data source.
+CodexBar 是自用的原生 macOS 菜单栏应用，同时显示 Codex 五小时和每周窗口的当前剩余额度。目标设备为运行 macOS 26.5 的 Apple M1 Pro，数据来自已安装的 `codex-cli 0.147.0`。
 
-## Goals and Non-Goals
+## 目标与范围
 
-The menu bar SHALL continuously display `5h 80% · 周 25%`, refresh promptly, start at login when enabled, and make failures visible without replacing valid values with misleading zeros. The first version SHALL NOT store usage history, predict exhaustion, send notifications, purchase credits, self-update, or support signed distribution.
+菜单栏持续显示 `5h 80% · 周 25%`，及时刷新，并支持登录时自动启动。查询失败时明确标示异常，保留最后有效值，不能用零代替未知数据。首版不保存用量历史，不预测额度耗尽时间，不发送通知，不购买额度，不提供自动更新或正式签名分发。
 
-## Architecture
+## 架构
 
-The app will be a SwiftUI macOS application using `MenuBarExtra`. Its components are deliberately separated:
+应用使用 SwiftUI 的 `MenuBarExtra`，组件职责如下：
 
-- `CodexAppServerClient`: locates the `codex` executable, manages the `codex app-server` child process, performs the required JSON-RPC initialization, sends requests, and receives notifications.
-- `RateLimitParser`: selects the general Codex limit bucket, identifies five-hour and weekly windows from their durations, and converts `usedPercent` to remaining percent.
-- `UsageViewModel`: owns refresh state, last-known-good values, retry behavior, and display colors.
-- `MenuBarView`: renders the menu bar label and dropdown actions.
-- `LoginItemManager`: registers or removes the login item through `SMAppService`.
+- `CodexAppServerClient`：定位 `codex` 可执行文件，管理 App Server 子进程，完成 JSON-RPC 初始化、请求与通知。
+- `RateLimitParser`：选择通用 Codex 额度，识别五小时与每周窗口，将 `usedPercent` 转为剩余百分比。
+- `UsageViewModel`：管理刷新状态、最后有效值、重试和显示颜色。
+- `MenuBarView`：绘制菜单栏标签及下拉面板。
+- `LoginItemManager`：通过 `SMAppService` 注册或取消登录项。
 
-On launch, the app starts App Server, initializes the session, requests `account/rateLimits/read`, and subscribes to `account/rateLimits/updated`. A 60-second timer provides a fallback refresh. App Server termination triggers bounded exponential retries, capped at 60 seconds.
+启动后初始化 App Server，调用 `account/rateLimits/read` 并接收 `account/rateLimits/updated`。每 60 秒主动刷新作为补充。App Server 退出时采用逐渐延长间隔的重试策略，最大间隔 60 秒。
 
-## Interface
+## 界面
 
-The selected visual direction is “status colors.” Both windows remain visible in the menu bar. Remaining values at or above 50% are green, 20–49% are orange, and below 20% are red. Missing or stale data is gray with a warning symbol.
+采用已选定的 C「状态颜色」样式。菜单栏同时展示两个窗口；剩余量 ≥50% 为绿色，20–49% 为橙色，低于 20% 为红色。数据缺失或陈旧时使用灰色及警告符号。
 
-The dropdown contains two quota cards with reset times, connection status, “立即刷新,” a “登录时自动启动” toggle, and “退出 CodexBar.” During an error, the last successful values remain visible and the dropdown explains whether Codex CLI is missing, authentication is unavailable, App Server disconnected, or the response lacks a required window.
+下拉面板包含两张额度卡片、重置时间、连接状态、“立即刷新”、“登录时自动启动”开关和“退出 CodexBar”。错误状态保留最后成功数值，并区分 CLI 缺失、未登录、连接断开和响应缺少窗口。
 
-## Security and Persistence
+## 安全与存储
 
-CodexBar delegates authentication to Codex App Server. It does not read credential files, log or persist access tokens, or call private web endpoints directly. Only the auto-start preference and last-known-good display values may be stored in `UserDefaults`. Process arguments are constructed without shell interpolation.
+认证交由 Codex App Server 管理；应用不读取凭据文件、不记录或持久保存访问令牌、不直接调用私有 Web 接口。`UserDefaults` 仅允许保存自动启动偏好和最后有效展示值。启动子进程时使用参数数组，避免 Shell 插值。
 
-## Testing
+## 测试
 
-Unit tests will cover JSON-RPC framing, rate-limit bucket and window selection, remaining-percentage clamping, color thresholds, missing fields, and last-known-good fallback. Client tests will use a fake process transport to verify initialization, refresh, notifications, disconnects, and retry limits. Manual acceptance will verify menu bar rendering in light and dark modes, login startup, CLI-not-found messaging, and recovery after terminating App Server.
+单元测试覆盖 JSON-RPC 消息边界、额度与窗口选择、百分比边界、颜色阈值、字段缺失及最后有效值回退。通过模拟传输测试初始化、刷新、通知、断线和重试上限。人工验收覆盖明暗模式、登录启动、CLI 缺失提示以及 App Server 退出后的恢复。
 
-## Acceptance Criteria
+## 验收标准
 
-- The menu bar shows both current remaining percentages within 60 seconds of launch.
-- Usage notifications update the label without waiting for the polling interval.
-- Values use the approved green, orange, red, and gray states.
-- Query failures never appear as zero remaining unless the server explicitly reports 100% used.
-- Login startup can be enabled and disabled from the dropdown.
-- No Codex authentication secret is read or stored by the application.
+- 数据源正常时，启动后 60 秒内显示两个剩余百分比。
+- 收到用量变化通知后立即更新，不等待定时刷新。
+- 使用已批准的绿、橙、红、灰四种状态。
+- 查询失败不能显示为剩余零，除非服务明确返回已用 100%。
+- 可在下拉面板开启和关闭登录启动。
+- 应用不读取或保存 Codex 认证秘密。
