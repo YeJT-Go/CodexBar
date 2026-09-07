@@ -76,6 +76,7 @@ actor JSONRPCConnection: RPCConnecting {
     private var nextRequestID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var timeoutTasks: [Int: Task<Void, Never>] = [:]
+    private var startWaiters: [CheckedContinuation<Void, Error>] = []
     private var isStarted = false
     private var isStarting = false
     private var lifecycleGeneration = 0
@@ -89,7 +90,13 @@ actor JSONRPCConnection: RPCConnecting {
     }
 
     func start() async throws {
-        guard !isStarted, !isStarting else { return }
+        guard !isStarted else { return }
+        if isStarting {
+            try await withCheckedThrowingContinuation { continuation in
+                startWaiters.append(continuation)
+            }
+            return
+        }
         isStarting = true
         let generation = lifecycleGeneration
 
@@ -107,9 +114,11 @@ actor JSONRPCConnection: RPCConnecting {
             }
             isStarting = false
             isStarted = true
+            finishStartWaiters(with: .success(()))
         } catch {
             if lifecycleGeneration == generation {
                 isStarting = false
+                finishStartWaiters(with: .failure(error))
             }
             throw error
         }
@@ -178,6 +187,7 @@ actor JSONRPCConnection: RPCConnecting {
         lifecycleGeneration += 1
         isStarted = false
         isStarting = false
+        finishStartWaiters(with: .failure(JSONRPCError.disconnected))
         failAllPending(with: JSONRPCError.disconnected)
         await transport.stop()
     }
@@ -225,7 +235,14 @@ actor JSONRPCConnection: RPCConnecting {
         lifecycleGeneration += 1
         isStarted = false
         isStarting = false
+        finishStartWaiters(with: .failure(JSONRPCError.disconnected))
         failAllPending(with: JSONRPCError.disconnected)
+    }
+
+    private func finishStartWaiters(with result: Result<Void, Error>) {
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume(with: result) }
     }
 
     private func finishRequest(_ id: Int, with result: Result<JSONValue, Error>) {

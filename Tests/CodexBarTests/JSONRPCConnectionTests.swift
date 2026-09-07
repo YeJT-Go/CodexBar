@@ -136,32 +136,66 @@ final class JSONRPCConnectionTests: XCTestCase {
         let transport = FakeRPCTransport(blockStart: true)
         let connection = JSONRPCConnection(transport: transport)
 
-        let start = Task { try await connection.start() }
+        let firstStart = Task { try await connection.start() }
         await transport.waitForStartCalls(count: 1)
+        let secondStart = Task { try await connection.start() }
         await transport.terminate(code: 9)
+
+        do {
+            try await secondStart.value
+            XCTFail("Expected shared termination result")
+        } catch {
+            XCTAssertEqual(error as? JSONRPCError, .disconnected)
+        }
         await transport.releaseStart()
 
         do {
-            try await start.value
+            try await firstStart.value
             XCTFail("Expected termination during start")
         } catch {
             XCTAssertEqual(error as? JSONRPCError, .disconnected)
         }
+    }
+
+    func testConcurrentStartsRemainPendingUntilInitialStartCompletes() async throws {
+        let transport = FakeRPCTransport(blockStart: true)
+        let connection = JSONRPCConnection(transport: transport)
+
+        let first = Task { try await connection.start() }
+        await transport.waitForStartCalls(count: 1)
+        let secondReturned = expectation(description: "second start returned before initial start was released")
+        secondReturned.isInverted = true
+        let second = Task {
+            try await connection.start()
+            secondReturned.fulfill()
+        }
+
+        await fulfillment(of: [secondReturned], timeout: 0.05)
+        await transport.releaseStart()
+        try await first.value
+        try await second.value
+
         let startCallCount = await transport.startCallCount
         XCTAssertEqual(startCallCount, 1)
     }
 
-    func testConcurrentStartsUseOneTransportStart() async throws {
+    func testConcurrentStartsShareInitialStartFailure() async throws {
         let transport = FakeRPCTransport(blockStart: true)
         let connection = JSONRPCConnection(transport: transport)
 
         let first = Task { try await connection.start() }
         await transport.waitForStartCalls(count: 1)
         let second = Task { try await connection.start() }
-        await transport.releaseStart()
-        try await first.value
-        try await second.value
+        await transport.releaseStart(error: .malformedMessage)
 
+        for start in [first, second] {
+            do {
+                try await start.value
+                XCTFail("Expected shared startup failure")
+            } catch {
+                XCTAssertEqual(error as? JSONRPCError, .malformedMessage)
+            }
+        }
         let startCallCount = await transport.startCallCount
         XCTAssertEqual(startCallCount, 1)
     }
@@ -218,14 +252,14 @@ private actor FakeRPCTransport: RPCTransport {
     private var onTermination: (@Sendable (Int32) -> Void)?
     private var writes: [Data] = []
     private var writeWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
-    private let blockStart: Bool
+    private var remainingBlockedStarts: Int
     private var startCallWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
-    private var startContinuation: CheckedContinuation<Void, Never>?
+    private var startContinuation: CheckedContinuation<Void, Error>?
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
 
     init(blockStart: Bool = false) {
-        self.blockStart = blockStart
+        self.remainingBlockedStarts = blockStart ? 1 : 0
     }
 
     func start(
@@ -236,8 +270,9 @@ private actor FakeRPCTransport: RPCTransport {
         self.onLine = onLine
         self.onTermination = onTermination
         resumeStartCallWaiters()
-        if blockStart {
-            await withCheckedContinuation { continuation in
+        if remainingBlockedStarts > 0 {
+            remainingBlockedStarts -= 1
+            try await withCheckedThrowingContinuation { continuation in
                 startContinuation = continuation
             }
         }
@@ -266,8 +301,12 @@ private actor FakeRPCTransport: RPCTransport {
         }
     }
 
-    func releaseStart() {
-        startContinuation?.resume()
+    func releaseStart(error: JSONRPCError? = nil) {
+        if let error {
+            startContinuation?.resume(throwing: error)
+        } else {
+            startContinuation?.resume()
+        }
         startContinuation = nil
     }
 
