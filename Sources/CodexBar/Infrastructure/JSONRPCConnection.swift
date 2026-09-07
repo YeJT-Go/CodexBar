@@ -77,6 +77,8 @@ actor JSONRPCConnection: RPCConnecting {
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var timeoutTasks: [Int: Task<Void, Never>] = [:]
     private var isStarted = false
+    private var isStarting = false
+    private var lifecycleGeneration = 0
 
     private(set) var onNotification: NotificationHandler?
 
@@ -87,16 +89,30 @@ actor JSONRPCConnection: RPCConnecting {
     }
 
     func start() async throws {
-        guard !isStarted else { return }
-        try await transport.start(
-            onLine: { [weak self] data in
-                Task { await self?.receive(data) }
-            },
-            onTermination: { [weak self] _ in
-                Task { await self?.transportDidTerminate() }
+        guard !isStarted, !isStarting else { return }
+        isStarting = true
+        let generation = lifecycleGeneration
+
+        do {
+            try await transport.start(
+                onLine: { [weak self] data in
+                    Task { await self?.receive(data) }
+                },
+                onTermination: { [weak self] _ in
+                    Task { await self?.transportDidTerminate(generation: generation) }
+                }
+            )
+            guard lifecycleGeneration == generation, isStarting else {
+                throw JSONRPCError.disconnected
             }
-        )
-        isStarted = true
+            isStarting = false
+            isStarted = true
+        } catch {
+            if lifecycleGeneration == generation {
+                isStarting = false
+            }
+            throw error
+        }
     }
 
     func request(
@@ -159,7 +175,9 @@ actor JSONRPCConnection: RPCConnecting {
     }
 
     func stop() async {
+        lifecycleGeneration += 1
         isStarted = false
+        isStarting = false
         failAllPending(with: JSONRPCError.disconnected)
         await transport.stop()
     }
@@ -202,8 +220,11 @@ actor JSONRPCConnection: RPCConnecting {
         finishRequest(id, with: .failure(JSONRPCError.remote(code: code, message: message)))
     }
 
-    private func transportDidTerminate() {
+    private func transportDidTerminate(generation: Int) {
+        guard lifecycleGeneration == generation else { return }
+        lifecycleGeneration += 1
         isStarted = false
+        isStarting = false
         failAllPending(with: JSONRPCError.disconnected)
     }
 

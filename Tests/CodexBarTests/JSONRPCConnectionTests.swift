@@ -17,6 +17,9 @@ final class JSONRPCConnectionTests: XCTestCase {
         let sent = try await transport.request(at: 0)
         XCTAssertEqual(sent.method, "account/rateLimits/read")
         XCTAssertNil(sent.params)
+        let requestFrame = await transport.data(at: 0)
+        XCTAssertEqual(requestFrame.last, 0x0A)
+        XCTAssertNotEqual(requestFrame.dropLast().last, 0x0A)
 
         await transport.emit(#"{"id":\#(sent.id),"result":{"rateLimits":{}}}"#)
         let result = try await request.value
@@ -38,8 +41,9 @@ final class JSONRPCConnectionTests: XCTestCase {
         let first = Task { try await connection.request(method: "first", params: nil) }
         let second = Task { try await connection.request(method: "second", params: nil) }
         await transport.waitForWrites(count: 2)
-        let firstSent = try await transport.request(at: 0)
-        let secondSent = try await transport.request(at: 1)
+        let sentRequests = try await transport.requests()
+        let firstSent = try XCTUnwrap(sentRequests.first { $0.method == "first" })
+        let secondSent = try XCTUnwrap(sentRequests.first { $0.method == "second" })
 
         await transport.emit(#"{"id":\#(secondSent.id),"result":"second"}"#)
         await transport.emit(#"{"id":\#(firstSent.id),"result":"first"}"#)
@@ -108,6 +112,60 @@ final class JSONRPCConnectionTests: XCTestCase {
         XCTAssertEqual(pendingRequestCount, 0)
     }
 
+    func testSendsNotificationWithoutIDAndWithSingleTrailingNewline() async throws {
+        let transport = FakeRPCTransport()
+        let connection = JSONRPCConnection(transport: transport)
+        try await connection.start()
+
+        try await connection.notify(method: "initialized", params: .object(["ready": .bool(true)]))
+        await transport.waitForWrites(count: 1)
+        let frame = await transport.data(at: 0)
+        XCTAssertEqual(frame.last, 0x0A)
+        XCTAssertNotEqual(frame.dropLast().last, 0x0A)
+
+        let message = try await transport.message(at: 0)
+        guard case let .object(values) = message else {
+            return XCTFail("Expected object notification")
+        }
+        XCTAssertNil(values["id"])
+        XCTAssertEqual(values["method"], .string("initialized"))
+        XCTAssertEqual(values["params"], .object(["ready": .bool(true)]))
+    }
+
+    func testTerminationDuringStartDoesNotReviveConnection() async throws {
+        let transport = FakeRPCTransport(blockStart: true)
+        let connection = JSONRPCConnection(transport: transport)
+
+        let start = Task { try await connection.start() }
+        await transport.waitForStartCalls(count: 1)
+        await transport.terminate(code: 9)
+        await transport.releaseStart()
+
+        do {
+            try await start.value
+            XCTFail("Expected termination during start")
+        } catch {
+            XCTAssertEqual(error as? JSONRPCError, .disconnected)
+        }
+        let startCallCount = await transport.startCallCount
+        XCTAssertEqual(startCallCount, 1)
+    }
+
+    func testConcurrentStartsUseOneTransportStart() async throws {
+        let transport = FakeRPCTransport(blockStart: true)
+        let connection = JSONRPCConnection(transport: transport)
+
+        let first = Task { try await connection.start() }
+        await transport.waitForStartCalls(count: 1)
+        let second = Task { try await connection.start() }
+        await transport.releaseStart()
+        try await first.value
+        try await second.value
+
+        let startCallCount = await transport.startCallCount
+        XCTAssertEqual(startCallCount, 1)
+    }
+
     func testCancellingCallerRemovesPendingRequest() async throws {
         let transport = FakeRPCTransport()
         let connection = JSONRPCConnection(transport: transport)
@@ -160,14 +218,29 @@ private actor FakeRPCTransport: RPCTransport {
     private var onTermination: (@Sendable (Int32) -> Void)?
     private var writes: [Data] = []
     private var writeWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private let blockStart: Bool
+    private var startCallWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var startContinuation: CheckedContinuation<Void, Never>?
+    private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
+
+    init(blockStart: Bool = false) {
+        self.blockStart = blockStart
+    }
 
     func start(
         onLine: @escaping @Sendable (Data) -> Void,
         onTermination: @escaping @Sendable (Int32) -> Void
     ) async throws {
+        startCallCount += 1
         self.onLine = onLine
         self.onTermination = onTermination
+        resumeStartCallWaiters()
+        if blockStart {
+            await withCheckedContinuation { continuation in
+                startContinuation = continuation
+            }
+        }
     }
 
     func write(_ data: Data) async throws {
@@ -184,6 +257,30 @@ private actor FakeRPCTransport: RPCTransport {
         await withCheckedContinuation { continuation in
             writeWaiters.append((count, continuation))
         }
+    }
+
+    func waitForStartCalls(count: Int) async {
+        guard startCallCount < count else { return }
+        await withCheckedContinuation { continuation in
+            startCallWaiters.append((count, continuation))
+        }
+    }
+
+    func releaseStart() {
+        startContinuation?.resume()
+        startContinuation = nil
+    }
+
+    func data(at index: Int) -> Data {
+        writes[index]
+    }
+
+    func message(at index: Int) throws -> JSONValue {
+        try JSONDecoder().decode(JSONValue.self, from: writes[index])
+    }
+
+    func requests() throws -> [RecordedRequest] {
+        try writes.indices.map(request(at:))
     }
 
     func request(at index: Int) throws -> RecordedRequest {
@@ -210,6 +307,12 @@ private actor FakeRPCTransport: RPCTransport {
     private func resumeWriteWaiters() {
         let ready = writeWaiters.filter { writes.count >= $0.count }
         writeWaiters.removeAll { writes.count >= $0.count }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    private func resumeStartCallWaiters() {
+        let ready = startCallWaiters.filter { startCallCount >= $0.count }
+        startCallWaiters.removeAll { startCallCount >= $0.count }
         ready.forEach { $0.continuation.resume() }
     }
 }
