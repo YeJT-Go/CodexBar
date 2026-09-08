@@ -180,6 +180,133 @@ final class UsageViewModelTests: XCTestCase {
         await model.stop()
     }
 
+    func testDisconnectAfterSuccessRestartsBackoffAtOneSecond() async {
+        let timerSleeper = ControlledSleeper()
+        let reconnectSleeper = ControlledSleeper()
+        let provider = FakeUsageProvider(
+            connectResults: [
+                .failure(TestFailure.offline),
+                .success(()),
+                .failure(TestFailure.offline)
+            ],
+            fetchResults: [
+                .success(makeResponse(fiveHourUsed: 10, weeklyUsed: 20)),
+                .failure(CodexClientError.serverExited(code: 1, stderr: "exited"))
+            ]
+        )
+        let model = UsageViewModel(
+            client: provider,
+            store: InMemoryUsageStore(),
+            sleep: timerSleeper.sleep,
+            reconnectSleep: reconnectSleeper.sleep
+        )
+
+        model.start()
+        await eventually {
+            let sleepCount = await reconnectSleeper.getCallCount()
+            return provider.connectCount == 1 && sleepCount == 1
+        }
+        let initialDelay = await reconnectSleeper.getFirstDuration()
+        XCTAssertEqual(initialDelay, .seconds(1))
+        await reconnectSleeper.resumeFirst()
+        await eventually {
+            guard case .current = model.state else { return false }
+            return provider.connectCount == 2 && provider.fetchCount == 1
+        }
+
+        await timerSleeper.resumeFirst()
+        await eventually { provider.fetchCount == 2 }
+        await eventually {
+            let sleepCount = await reconnectSleeper.getCallCount()
+            return provider.connectCount == 3 && sleepCount == 1
+        }
+        let postDisconnectDelay = await reconnectSleeper.getFirstDuration()
+        XCTAssertEqual(postDisconnectDelay, .seconds(1))
+        await model.stop()
+    }
+
+    func testImmediateExitAfterSuccessfulReconnectWaitsBeforeTryingAgain() async {
+        let timerSleeper = ControlledSleeper()
+        let reconnectSleeper = ControlledSleeper()
+        let provider = FakeUsageProvider(
+            connectResults: [.success(()), .success(()), .success(())],
+            fetchResults: [
+                .success(makeResponse(fiveHourUsed: 10, weeklyUsed: 20)),
+                .failure(CodexClientError.serverExited(code: 1, stderr: "first exit")),
+                .failure(CodexClientError.serverExited(code: 1, stderr: "second exit"))
+            ]
+        )
+        let model = UsageViewModel(
+            client: provider,
+            store: InMemoryUsageStore(),
+            sleep: timerSleeper.sleep,
+            reconnectSleep: reconnectSleeper.sleep
+        )
+
+        model.start()
+        await eventually {
+            guard case .current = model.state else { return false }
+            return provider.connectCount == 1 && provider.fetchCount == 1
+        }
+        await timerSleeper.resumeFirst()
+        await eventually {
+            let sleepCount = await reconnectSleeper.getCallCount()
+            return provider.connectCount == 2 && provider.fetchCount == 3 && sleepCount == 1
+        }
+
+        let delay = await reconnectSleeper.getFirstDuration()
+        XCTAssertEqual(delay, .seconds(1))
+        XCTAssertEqual(provider.connectCount, 2, "等待完成前不得忙循环重启")
+        await model.stop()
+    }
+
+    func testStopInvalidatesSuccessFromProviderThatIgnoresCancellation() async {
+        let sequence = GatedFetchSequence([
+            (AsyncGate(), makeResponse(fiveHourUsed: 10, weeklyUsed: 20))
+        ])
+        let provider = FakeUsageProvider(fetch: { try await sequence.next() })
+        let store = InMemoryUsageStore()
+        let model = UsageViewModel(client: provider, store: store)
+
+        let refresh = Task { await model.refresh() }
+        await eventually { provider.fetchCount == 1 }
+        await model.stop()
+        await sequence.open(at: 0)
+        await refresh.value
+
+        XCTAssertEqual(model.state, .loading)
+        XCTAssertNil(store.load())
+    }
+
+    func testNewLifecycleRefreshIsNeverTemporarilyOverwrittenByOldResult() async {
+        let sequence = GatedFetchSequence([
+            (AsyncGate(), makeResponse(fiveHourUsed: 90, weeklyUsed: 90)),
+            (AsyncGate(), makeResponse(fiveHourUsed: 20, weeklyUsed: 30))
+        ])
+        let provider = FakeUsageProvider(fetch: { try await sequence.next() })
+        let store = InMemoryUsageStore()
+        let model = UsageViewModel(client: provider, store: store)
+
+        let oldRefresh = Task { await model.refresh() }
+        await eventually { provider.fetchCount == 1 }
+        await model.stop()
+        let newRefresh = Task { await model.refresh() }
+        await eventually { provider.fetchCount == 2 }
+
+        await sequence.open(at: 0)
+        await oldRefresh.value
+        XCTAssertEqual(model.state, .loading)
+        XCTAssertNil(store.load())
+
+        await sequence.open(at: 1)
+        await newRefresh.value
+        guard case let .current(snapshot) = model.state else {
+            return XCTFail("新生命周期刷新应成功发布")
+        }
+        XCTAssertEqual(snapshot.fiveHour.remainingPercent, 80)
+        XCTAssertEqual(store.load(), snapshot)
+    }
+
     func testStopCancelsPendingWorkAndStopsClient() async {
         let sleeper = ControlledSleeper()
         let provider = FakeUsageProvider(
@@ -326,6 +453,27 @@ private actor AsyncGate {
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+private actor GatedFetchSequence {
+    private let entries: [(gate: AsyncGate, response: RateLimitsResponse)]
+    private var index = 0
+
+    init(_ entries: [(AsyncGate, RateLimitsResponse)]) {
+        self.entries = entries
+    }
+
+    func next() async throws -> RateLimitsResponse {
+        guard index < entries.count else { throw TestFailure.offline }
+        let entry = entries[index]
+        index += 1
+        await entry.gate.wait()
+        return entry.response
+    }
+
+    func open(at index: Int) async {
+        await entries[index].gate.open()
     }
 }
 

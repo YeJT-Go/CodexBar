@@ -12,6 +12,11 @@ enum UsageState: Equatable, Sendable {
 final class UsageViewModel: ObservableObject {
     typealias Sleep = @Sendable (Duration) async throws -> Void
 
+    private struct RefreshToken: Equatable {
+        let lifecycle: Int
+        let generation: Int
+    }
+
     @Published private(set) var state: UsageState
 
     private let client: any CodexUsageProviding
@@ -24,12 +29,16 @@ final class UsageViewModel: ObservableObject {
 
     private var lastGoodSnapshot: UsageSnapshot?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectGeneration = 0
+    private var activeReconnectGeneration: Int?
+    private var reconnectRequested = false
     private var timerTask: Task<Void, Never>?
     private var updatesTask: Task<Void, Never>?
     private var refreshTask: Task<Result<UsageSnapshot, Error>, Never>?
-    private var refreshGeneration: Int?
+    private var activeRefreshToken: RefreshToken?
+    private var latestValidRefreshToken: RefreshToken?
     private var nextRefreshGeneration = 0
-    private var lastAppliedGeneration = 0
+    private var lifecycleEpoch = 0
     private var isRunning = false
 
     init(
@@ -61,11 +70,10 @@ final class UsageViewModel: ObservableObject {
 
     func start() {
         guard !isRunning else { return }
+        beginNewLifecycle()
         isRunning = true
 
-        reconnectTask = Task { [weak self] in
-            await self?.runConnectionLoop()
-        }
+        requestReconnect()
         timerTask = Task { [weak self] in
             await self?.runRefreshLoop()
         }
@@ -80,10 +88,12 @@ final class UsageViewModel: ObservableObject {
 
     func refresh() async {
         let task: Task<Result<UsageSnapshot, Error>, Never>
-        let taskGeneration: Int
-        if let inFlight = refreshTask {
+        let token: RefreshToken
+        if let inFlight = refreshTask,
+           let inFlightToken = activeRefreshToken,
+           inFlightToken.lifecycle == lifecycleEpoch {
             task = inFlight
-            taskGeneration = refreshGeneration!
+            token = inFlightToken
         } else {
             let client = self.client
             let parser = self.parser
@@ -97,20 +107,25 @@ final class UsageViewModel: ObservableObject {
                 }
             }
             nextRefreshGeneration += 1
-            let createdGeneration = nextRefreshGeneration
+            let createdToken = RefreshToken(
+                lifecycle: lifecycleEpoch,
+                generation: nextRefreshGeneration
+            )
             refreshTask = created
-            refreshGeneration = createdGeneration
+            activeRefreshToken = createdToken
+            latestValidRefreshToken = createdToken
             task = created
-            taskGeneration = createdGeneration
+            token = createdToken
         }
 
         let result = await task.value
-        if refreshGeneration == taskGeneration {
+        if activeRefreshToken == token {
             refreshTask = nil
-            refreshGeneration = nil
+            activeRefreshToken = nil
         }
-        guard !Task.isCancelled, taskGeneration >= lastAppliedGeneration else { return }
-        lastAppliedGeneration = taskGeneration
+        guard !Task.isCancelled,
+              token.lifecycle == lifecycleEpoch,
+              latestValidRefreshToken == token else { return }
 
         switch result {
         case let .success(snapshot):
@@ -119,6 +134,9 @@ final class UsageViewModel: ObservableObject {
             state = .current(snapshot)
         case let .failure(error):
             publishFailure(error)
+            if isRunning, isConnectionFailure(error) {
+                requestReconnect()
+            }
         }
     }
 
@@ -127,28 +145,55 @@ final class UsageViewModel: ObservableObject {
             return
         }
         isRunning = false
+        lifecycleEpoch += 1
+        reconnectRequested = false
         reconnectTask?.cancel()
         timerTask?.cancel()
         updatesTask?.cancel()
         refreshTask?.cancel()
         reconnectTask = nil
+        activeReconnectGeneration = nil
         timerTask = nil
         updatesTask = nil
         refreshTask = nil
-        refreshGeneration = nil
+        activeRefreshToken = nil
+        latestValidRefreshToken = nil
         await client.stop()
     }
 
-    private func runConnectionLoop() async {
+    private func requestReconnect() {
+        guard isRunning else { return }
+        reconnectRequested = true
+        guard reconnectTask == nil else { return }
+
+        reconnectGeneration += 1
+        let generation = reconnectGeneration
+        let lifecycle = lifecycleEpoch
+        activeReconnectGeneration = generation
+        reconnectTask = Task { [weak self] in
+            await self?.runConnectionLoop(lifecycle: lifecycle)
+            self?.finishReconnect(generation: generation, lifecycle: lifecycle)
+        }
+    }
+
+    private func runConnectionLoop(lifecycle: Int) async {
         let delays = [1, 2, 4, 8, 16, 32, 60]
         var retryIndex = 0
 
-        while isRunning && !Task.isCancelled {
+        while isRunning && lifecycleEpoch == lifecycle && !Task.isCancelled {
             do {
                 try await client.connect()
                 retryIndex = 0
+                reconnectRequested = false
                 await refresh()
-                return
+                if !reconnectRequested { return }
+                let seconds = delays[min(retryIndex, delays.count - 1)]
+                retryIndex = min(retryIndex + 1, delays.count - 1)
+                do {
+                    try await reconnectSleep(.seconds(seconds))
+                } catch {
+                    return
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -161,6 +206,15 @@ final class UsageViewModel: ObservableObject {
                     return
                 }
             }
+        }
+    }
+
+    private func finishReconnect(generation: Int, lifecycle: Int) {
+        guard activeReconnectGeneration == generation else { return }
+        reconnectTask = nil
+        activeReconnectGeneration = nil
+        if reconnectRequested, isRunning, lifecycleEpoch == lifecycle {
+            requestReconnect()
         }
     }
 
@@ -183,5 +237,23 @@ final class UsageViewModel: ObservableObject {
         } else {
             state = .unavailable(message)
         }
+    }
+
+    private func beginNewLifecycle() {
+        lifecycleEpoch += 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        activeRefreshToken = nil
+        latestValidRefreshToken = nil
+    }
+
+    private func isConnectionFailure(_ error: Error) -> Bool {
+        if let rpcError = error as? JSONRPCError, rpcError == .disconnected {
+            return true
+        }
+        if case .serverExited = error as? CodexClientError {
+            return true
+        }
+        return false
     }
 }
