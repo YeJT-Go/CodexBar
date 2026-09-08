@@ -14,7 +14,8 @@ actor CodexAppServerClient: CodexUsageProviding {
     private var isConnected = false
     private var isStopped = false
     private var notificationRefreshInFlight = false
-    private var lastNotificationFingerprint: Data?
+    private var notificationRefreshPending = false
+    private var currentNotificationBatch: Set<Data> = []
     private var lastPublishedResponse: RateLimitsResponse?
 
     init(connection: any RPCConnecting) {
@@ -79,6 +80,8 @@ actor CodexAppServerClient: CodexUsageProviding {
         isStopped = true
         isConnected = false
         notificationRefreshInFlight = false
+        notificationRefreshPending = false
+        currentNotificationBatch.removeAll()
         await connection.setNotificationHandler(nil)
         await connection.stop()
         updateContinuation.finish()
@@ -97,9 +100,11 @@ actor CodexAppServerClient: CodexUsageProviding {
     private func receiveNotification(method: String, params: JSONValue?) {
         guard method == "account/rateLimits/updated", !isStopped else { return }
         let fingerprint = notificationFingerprint(params)
-        guard fingerprint != lastNotificationFingerprint else { return }
-        lastNotificationFingerprint = fingerprint
-        guard !notificationRefreshInFlight else { return }
+        guard currentNotificationBatch.insert(fingerprint).inserted else { return }
+        if notificationRefreshInFlight {
+            notificationRefreshPending = true
+            return
+        }
         notificationRefreshInFlight = true
 
         Task { [weak self] in
@@ -108,10 +113,19 @@ actor CodexAppServerClient: CodexUsageProviding {
     }
 
     private func refreshAfterNotification() async {
-        defer { notificationRefreshInFlight = false }
-        guard let response = try? await fetchRateLimits(), response != lastPublishedResponse else { return }
-        lastPublishedResponse = response
-        updateContinuation.yield(response)
+        defer {
+            notificationRefreshInFlight = false
+            notificationRefreshPending = false
+            currentNotificationBatch.removeAll()
+        }
+
+        repeat {
+            notificationRefreshPending = false
+            if let response = try? await fetchRateLimits(), response != lastPublishedResponse {
+                lastPublishedResponse = response
+                updateContinuation.yield(response)
+            }
+        } while notificationRefreshPending && !isStopped
     }
 
     private func notificationFingerprint(_ params: JSONValue?) -> Data {

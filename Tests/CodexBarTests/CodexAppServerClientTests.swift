@@ -117,6 +117,53 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    func testSameSparsePayloadRefreshesAgainAfterPreviousBatchCompletes() async throws {
+        let firstResponse = try fixture(namedCodexUsedPercent: 42, fallbackUsedPercent: 84)
+        let secondResponse = try fixture(namedCodexUsedPercent: 43, fallbackUsedPercent: 83)
+        let rpc = RecordingRPCConnection(responses: [
+            "account/rateLimits/read": [.success(firstResponse), .success(secondResponse)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+        let sparse: JSONValue = .object(["limitId": .string("codex")])
+
+        await rpc.emitNotification(method: "account/rateLimits/updated", params: sparse)
+        try await waitForCompletedRequests(on: rpc, method: "account/rateLimits/read", count: 1)
+        await rpc.emitNotification(method: "account/rateLimits/updated", params: sparse)
+        try await waitForCompletedRequests(on: rpc, method: "account/rateLimits/read", count: 2)
+
+        let requestCount = await rpc.requestCount(for: "account/rateLimits/read")
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testDifferentNotificationDuringRefreshQueuesOneSerialFollowUp() async throws {
+        let firstResponse = try fixture(namedCodexUsedPercent: 44, fallbackUsedPercent: 82)
+        let secondResponse = try fixture(namedCodexUsedPercent: 45, fallbackUsedPercent: 81)
+        let rpc = RecordingRPCConnection(
+            responses: ["account/rateLimits/read": [.success(firstResponse), .success(secondResponse)]],
+            suspendRateLimitRead: true
+        )
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        await rpc.emitNotification(
+            method: "account/rateLimits/updated",
+            params: .object(["usedPercent": .number(44)])
+        )
+        try await waitForRequests(on: rpc, method: "account/rateLimits/read", count: 1)
+        await rpc.emitNotification(
+            method: "account/rateLimits/updated",
+            params: .object(["usedPercent": .number(45)])
+        )
+        await rpc.releaseRateLimitRead()
+        try await waitForRequests(on: rpc, method: "account/rateLimits/read", count: 2)
+        await rpc.releaseRateLimitRead()
+        try await waitForCompletedRequests(on: rpc, method: "account/rateLimits/read", count: 2)
+
+        let maximumConcurrentReads = await rpc.maximumConcurrentRateLimitReads
+        XCTAssertEqual(maximumConcurrentReads, 1)
+    }
+
     func testStopStopsConnectionAndFinishesUpdates() async throws {
         let rpc = RecordingRPCConnection()
         let client = CodexAppServerClient(connection: rpc)
@@ -138,7 +185,7 @@ final class CodexAppServerClientTests: XCTestCase {
 
     func testProcessTransportFramesRealPipeChunksAndAddsNodeSearchPaths() async throws {
         let script = try TemporaryNodeScript(source: #"""
-        process.stdout.write('{"first":1}\n{"sec');
+        process.stdout.write('{"first":1,"sentinel":"' + process.env.CODEX_BAR_SENTINEL + '"}\n{"sec');
         setTimeout(() => {
           process.stdout.write('ond":2}\n');
           process.exit(0);
@@ -159,8 +206,26 @@ final class CodexAppServerClientTests: XCTestCase {
 
         let strings = await recorder.strings
         let exitCode = await recorder.exitCode
-        XCTAssertEqual(strings, [#"{"first":1}"#, #"{"second":2}"#])
+        XCTAssertEqual(strings, [#"{"first":1,"sentinel":"kept"}"#, #"{"second":2}"#])
         XCTAssertEqual(exitCode, 0)
+    }
+
+    func testImmediateProcessExitDeliversDrainedLineBeforeTermination() async throws {
+        let script = try TemporaryNodeScript(source: #"""
+        process.stdout.write('{"last":true}\n');
+        process.exit(0);
+        """#)
+        defer { script.remove() }
+        let transport = ProcessTransport(executableURL: script.url)
+        let recorder = SynchronousProcessEventRecorder()
+
+        try await transport.start(
+            onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
+            onTermination: { recorder.appendTermination($0) }
+        )
+        try await waitUntil { recorder.hasTerminated }
+
+        XCTAssertEqual(recorder.events, [.line(#"{"last":true}"#), .termination(0)])
     }
 
     func testNonzeroProcessExitFailsPendingRequestWithBoundedRedactedStderr() async throws {
@@ -187,6 +252,83 @@ final class CodexAppServerClientTests: XCTestCase {
             XCTAssertTrue(stderr.contains("[REDACTED]"))
         }
     }
+
+    func testImmediateExitRedactsCredentialFormsBeforeFourKilobyteLimit() async throws {
+        let script = try TemporaryNodeScript(source: #"""
+        process.stderr.write('z'.repeat(4050) + '\n');
+        process.stderr.write('Authorization: Basic basic-secret\n');
+        process.stderr.write('Authorization: Bearer bearer-secret\n');
+        process.stderr.write('OPENAI_API_KEY=sk-secret\n');
+        process.stderr.write('api_key=query-secret\n');
+        process.stderr.write('Cookie: session=cookie-secret\n');
+        process.exit(8);
+        """#)
+        defer { script.remove() }
+        let connection = JSONRPCConnection(transport: ProcessTransport(executableURL: script.url))
+        try await connection.start()
+
+        do {
+            _ = try await connection.request(method: "account/rateLimits/read", params: nil)
+            XCTFail("Expected the process exit to fail the pending request")
+        } catch let error as CodexClientError {
+            guard case let .serverExited(code, stderr) = error else {
+                return XCTFail("Unexpected client error: \(error)")
+            }
+            XCTAssertEqual(code, 8)
+            XCTAssertLessThanOrEqual(stderr.utf8.count, 4096)
+            for secret in ["basic-secret", "bearer-secret", "sk-secret", "query-secret", "cookie-secret"] {
+                XCTAssertFalse(stderr.contains(secret), "Leaked \(secret)")
+            }
+            XCTAssertTrue(stderr.contains("[REDACTED]"))
+        }
+    }
+
+    func testOversizedCredentialLineDoesNotLeakTailAcrossPipeChunks() async throws {
+        let script = try TemporaryNodeScript(source: #"""
+        process.stderr.write('OPENAI_API_KEY=' + 'boundary-secret'.repeat(400));
+        setTimeout(() => {
+          process.stderr.write('boundary-secret'.repeat(400) + '\n');
+          process.exit(9);
+        }, 20);
+        """#)
+        defer { script.remove() }
+        let connection = JSONRPCConnection(transport: ProcessTransport(executableURL: script.url))
+        try await connection.start()
+
+        do {
+            _ = try await connection.request(method: "account/rateLimits/read", params: nil)
+            XCTFail("Expected the process exit to fail the pending request")
+        } catch let error as CodexClientError {
+            guard case let .serverExited(code, stderr) = error else {
+                return XCTFail("Unexpected client error: \(error)")
+            }
+            XCTAssertEqual(code, 9)
+            XCTAssertLessThanOrEqual(stderr.utf8.count, 4096)
+            XCTAssertFalse(stderr.contains("boundary-secret"))
+            XCTAssertTrue(stderr.contains("[REDACTED OVERSIZED STDERR LINE]"))
+        }
+    }
+
+    func testStopTerminatesLongRunningProcess() async throws {
+        let script = try TemporaryNodeScript(source: #"""
+        process.on('SIGTERM', () => process.exit(0));
+        process.stdout.write('{"ready":true}\n');
+        setInterval(() => {}, 1000);
+        """#)
+        defer { script.remove() }
+        let transport = ProcessTransport(executableURL: script.url)
+        let recorder = SynchronousProcessEventRecorder()
+        try await transport.start(
+            onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
+            onTermination: { recorder.appendTermination($0) }
+        )
+        try await waitUntil { recorder.events.contains(.line(#"{"ready":true}"#)) }
+
+        await transport.stop()
+        try await waitUntil { recorder.hasTerminated }
+
+        XCTAssertEqual(recorder.events.last, .termination(0))
+    }
 }
 
 private enum RecordedRPCKind: Equatable, Sendable {
@@ -203,10 +345,12 @@ private struct RecordedRPCEvent: Equatable, Sendable {
 private actor RecordingRPCConnection: RPCConnecting {
     private var responses: [String: [Result<JSONValue, Error>]]
     private let suspendRateLimitRead: Bool
-    private var rateLimitReadContinuation: CheckedContinuation<Void, Never>?
+    private var rateLimitReadContinuations: [CheckedContinuation<Void, Never>] = []
     private var requestWaiters: [(method: String, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var completionWaiters: [(method: String, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var completedMethods: [String] = []
+    private var activeRateLimitReads = 0
+    private(set) var maximumConcurrentRateLimitReads = 0
     private(set) var events: [RecordedRPCEvent] = []
     private(set) var stopCallCount = 0
     private(set) var currentNotificationHandler: (@Sendable (String, JSONValue?) -> Void)?
@@ -226,10 +370,15 @@ private actor RecordingRPCConnection: RPCConnecting {
     func request(method: String, params: JSONValue?) async throws -> JSONValue {
         events.append(.init(kind: .request, method: method, params: params))
         resumeRequestWaiters()
-        if method == "account/rateLimits/read", suspendRateLimitRead {
-            await withCheckedContinuation { continuation in
-                rateLimitReadContinuation = continuation
+        if method == "account/rateLimits/read" {
+            activeRateLimitReads += 1
+            maximumConcurrentRateLimitReads = max(maximumConcurrentRateLimitReads, activeRateLimitReads)
+            if suspendRateLimitRead {
+                await withCheckedContinuation { continuation in
+                    rateLimitReadContinuations.append(continuation)
+                }
             }
+            activeRateLimitReads -= 1
         }
         completedMethods.append(method)
         resumeCompletionWaiters()
@@ -261,6 +410,10 @@ private actor RecordingRPCConnection: RPCConnecting {
         events.count { $0.kind == .request && $0.method == method }
     }
 
+    func completedRequestCount(for method: String) -> Int {
+        completedMethods.count(where: { $0 == method })
+    }
+
     func waitForRequests(method: String, count: Int) async {
         guard requestCount(for: method) < count else { return }
         await withCheckedContinuation { continuation in
@@ -276,8 +429,8 @@ private actor RecordingRPCConnection: RPCConnecting {
     }
 
     func releaseRateLimitRead() {
-        rateLimitReadContinuation?.resume()
-        rateLimitReadContinuation = nil
+        guard !rateLimitReadContinuations.isEmpty else { return }
+        rateLimitReadContinuations.removeFirst().resume()
     }
 
     private func resumeRequestWaiters() {
@@ -294,6 +447,61 @@ private actor RecordingRPCConnection: RPCConnecting {
             completedMethods.count(where: { $0 == waiter.method }) >= waiter.count
         }
         ready.forEach { $0.continuation.resume() }
+    }
+}
+
+private enum SynchronousProcessEvent: Equatable {
+    case line(String)
+    case termination(Int32)
+}
+
+private final class SynchronousProcessEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEvents: [SynchronousProcessEvent] = []
+
+    var events: [SynchronousProcessEvent] { lock.withLock { storedEvents } }
+    var hasTerminated: Bool {
+        lock.withLock { storedEvents.contains { if case .termination = $0 { true } else { false } } }
+    }
+
+    func appendLine(_ line: String) {
+        lock.withLock { storedEvents.append(.line(line)) }
+    }
+
+    func appendTermination(_ code: Int32) {
+        lock.withLock { storedEvents.append(.termination(code)) }
+    }
+}
+
+private enum TestWaitError: Error {
+    case timedOut
+}
+
+private func waitForRequests(
+    on rpc: RecordingRPCConnection,
+    method: String,
+    count: Int
+) async throws {
+    try await waitUntil { await rpc.requestCount(for: method) >= count }
+}
+
+private func waitForCompletedRequests(
+    on rpc: RecordingRPCConnection,
+    method: String,
+    count: Int
+) async throws {
+    try await waitUntil { await rpc.completedRequestCount(for: method) >= count }
+}
+
+private func waitUntil(
+    timeout: Duration = .seconds(1),
+    condition: @escaping @Sendable () async -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !(await condition()) {
+        guard clock.now < deadline else { throw TestWaitError.timedOut }
+        try await Task.sleep(for: .milliseconds(1))
     }
 }
 
