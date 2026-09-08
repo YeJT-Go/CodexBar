@@ -4,14 +4,16 @@ import Darwin
 final class ProcessTransport: RPCTransport, @unchecked Sendable {
     private let executableURL: URL
     private let environment: [String: String]
-    private let state = ProcessTransportState()
+    private let state: ProcessTransportState
 
     init(
         executableURL: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        maximumStdoutFrameBytes: Int = JSONLineFramer.defaultMaximumFrameBytes
     ) {
         self.executableURL = executableURL
         self.environment = Self.environmentWithCommandSearchPaths(environment)
+        state = ProcessTransportState(maximumStdoutFrameBytes: maximumStdoutFrameBytes)
     }
 
     func start(
@@ -58,6 +60,7 @@ private final class ProcessTransportState: @unchecked Sendable {
     private static let maximumPendingStderrLineBytes = 4 * 1024
     private static let terminationDrainDeadline: TimeInterval = 0.05
     private static let maximumBytesPerReadPass = 64 * 1024
+    private static let readLoopPollTimeoutMilliseconds: Int32 = 10
 
     private let lock = NSLock()
     private let readCallbackCondition = NSCondition()
@@ -65,13 +68,18 @@ private final class ProcessTransportState: @unchecked Sendable {
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
-    private var stdoutBuffer = Data()
+    private var stdoutFramer: JSONLineFramer
     private var stderrBuffer = Data()
     private var stderrLineBuffer = Data()
     private var isDiscardingOversizedStderrLine = false
+    private var stdoutProtocolViolationDiagnostic: String?
     private var lastTerminationError: CodexClientError?
     private var readCallbacksInProgress = 0
     private var isTerminating = false
+
+    init(maximumStdoutFrameBytes: Int) {
+        stdoutFramer = JSONLineFramer(maximumFrameBytes: maximumStdoutFrameBytes)
+    }
 
     func start(
         executableURL: URL,
@@ -93,10 +101,11 @@ private final class ProcessTransportState: @unchecked Sendable {
             process.standardOutput = outputPipe
             process.standardError = errorPipe
 
-            stdoutBuffer.removeAll(keepingCapacity: true)
+            stdoutFramer.reset()
             stderrBuffer.removeAll(keepingCapacity: true)
             stderrLineBuffer.removeAll(keepingCapacity: true)
             isDiscardingOversizedStderrLine = false
+            stdoutProtocolViolationDiagnostic = nil
             lastTerminationError = nil
             resetReadCallbackCoordination()
             self.process = process
@@ -106,27 +115,6 @@ private final class ProcessTransportState: @unchecked Sendable {
             makeNonBlocking(outputPipe.fileHandleForReading.fileDescriptor)
             makeNonBlocking(errorPipe.fileHandleForReading.fileDescriptor)
 
-            outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                guard let self, self.beginReadCallback() else { return }
-                defer { self.endReadCallback() }
-                let result = self.readAvailableData(from: handle.fileDescriptor) {
-                    self.consumeStdout($0, onLine: onLine)
-                }
-                if result.reachedEOF {
-                    handle.readabilityHandler = nil
-                }
-            }
-            errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                guard let self, self.beginReadCallback() else { return }
-                defer { self.endReadCallback() }
-                let result = self.readAvailableData(
-                    from: handle.fileDescriptor,
-                    consume: self.consumeStderr
-                )
-                if result.reachedEOF {
-                    handle.readabilityHandler = nil
-                }
-            }
             process.terminationHandler = { [weak self] process in
                 self?.didTerminate(
                     code: process.terminationStatus,
@@ -137,9 +125,14 @@ private final class ProcessTransportState: @unchecked Sendable {
 
             do {
                 try process.run()
+                startReadLoop(fileDescriptor: outputPipe.fileHandleForReading.fileDescriptor) {
+                    self.consumeStdout($0, onLine: onLine)
+                }
+                startReadLoop(
+                    fileDescriptor: errorPipe.fileHandleForReading.fileDescriptor,
+                    consume: consumeStderr
+                )
             } catch {
-                outputPipe.fileHandleForReading.readabilityHandler = nil
-                errorPipe.fileHandleForReading.readabilityHandler = nil
                 self.process = nil
                 inputHandle = nil
                 outputHandle = nil
@@ -176,27 +169,32 @@ private final class ProcessTransportState: @unchecked Sendable {
 
     func terminationError(for code: Int32) -> CodexClientError? {
         lock.withLock {
-            guard code != 0 else { return nil }
-            if case let .serverExited(storedCode, _)? = lastTerminationError, storedCode == code {
+            if let lastTerminationError {
                 return lastTerminationError
             }
+            guard code != 0 else { return nil }
             return .serverExited(code: code, stderr: sanitizedStderr())
         }
     }
 
     private func consumeStdout(_ data: Data, onLine: @escaping @Sendable (Data) -> Void) {
+        var shouldTerminate = false
         let lines: [Data] = lock.withLock {
-            stdoutBuffer.append(data)
-            var completed: [Data] = []
-            while let newline = stdoutBuffer.firstIndex(of: 0x0A) {
-                var line = Data(stdoutBuffer[..<newline])
-                stdoutBuffer.removeSubrange(...newline)
-                if line.last == 0x0D { line.removeLast() }
-                if !line.isEmpty { completed.append(line) }
+            let output = stdoutFramer.consume(data)
+            if output.didExceedMaximumFrameBytes, stdoutProtocolViolationDiagnostic == nil {
+                stdoutProtocolViolationDiagnostic =
+                    "Transport error: stdout frame exceeded \(stdoutFramer.maximumFrameBytes)-byte limit"
+                shouldTerminate = true
             }
-            return completed
+            return output.lines
         }
         lines.forEach(onLine)
+        if shouldTerminate {
+            let process = lock.withLock { self.process }
+            if process?.isRunning == true {
+                process?.terminate()
+            }
+        }
     }
 
     private func consumeStderr(_ data: Data) {
@@ -235,8 +233,6 @@ private final class ProcessTransportState: @unchecked Sendable {
     ) {
         markTerminating()
         let handles = lock.withLock { (outputHandle, errorHandle, inputHandle) }
-        handles.0?.readabilityHandler = nil
-        handles.1?.readabilityHandler = nil
         waitForReadCallbacksToFinish()
 
         drainAvailableData(
@@ -252,7 +248,12 @@ private final class ProcessTransportState: @unchecked Sendable {
             }
             stderrLineBuffer.removeAll(keepingCapacity: true)
             isDiscardingOversizedStderrLine = false
-            if code != 0 {
+            if let stdoutProtocolViolationDiagnostic {
+                lastTerminationError = .serverExited(
+                    code: code,
+                    stderr: stdoutProtocolViolationDiagnostic
+                )
+            } else if code != 0 {
                 lastTerminationError = .serverExited(code: code, stderr: sanitizedStderr())
             }
             inputHandle = nil
@@ -391,6 +392,43 @@ private final class ProcessTransportState: @unchecked Sendable {
         return .init(bytesRead: totalBytesRead, reachedEOF: false)
     }
 
+    private func startReadLoop(
+        fileDescriptor: Int32,
+        consume: @escaping @Sendable (Data) -> Void
+    ) {
+        guard beginReadCallback() else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            defer { self.endReadCallback() }
+            self.runReadLoop(fileDescriptor: fileDescriptor, consume: consume)
+        }
+    }
+
+    private func runReadLoop(fileDescriptor: Int32, consume: (Data) -> Void) {
+        while shouldContinueReading {
+            var descriptor = pollfd(
+                fd: fileDescriptor,
+                events: Int16(POLLIN | POLLHUP | POLLERR),
+                revents: 0
+            )
+            let result = poll(&descriptor, 1, Self.readLoopPollTimeoutMilliseconds)
+            if result < 0 {
+                if errno == EINTR { continue }
+                return
+            }
+            if result == 0 { continue }
+            if readAvailableData(from: fileDescriptor, consume: consume).reachedEOF {
+                return
+            }
+        }
+    }
+
+    private var shouldContinueReading: Bool {
+        readCallbackCondition.lock()
+        defer { readCallbackCondition.unlock() }
+        return !isTerminating
+    }
+
     private func resetReadCallbackCoordination() {
         readCallbackCondition.lock()
         isTerminating = false
@@ -439,4 +477,68 @@ private struct DrainSource {
 private struct NonBlockingReadResult {
     let bytesRead: Int
     let reachedEOF: Bool
+}
+
+struct JSONLineFramer {
+    static let defaultMaximumFrameBytes = 1024 * 1024
+
+    let maximumFrameBytes: Int
+    private var pending = Data()
+    private(set) var isDiscardingOversizedFrame = false
+
+    var pendingByteCount: Int { pending.count }
+
+    init(maximumFrameBytes: Int = defaultMaximumFrameBytes) {
+        precondition(maximumFrameBytes > 0)
+        self.maximumFrameBytes = maximumFrameBytes
+    }
+
+    mutating func reset() {
+        pending.removeAll(keepingCapacity: false)
+        isDiscardingOversizedFrame = false
+    }
+
+    mutating func consume(_ data: Data) -> JSONLineFramerOutput {
+        pending.append(data)
+        var lines: [Data] = []
+        var didExceedMaximumFrameBytes = false
+        while true {
+            if isDiscardingOversizedFrame {
+                guard let newline = pending.firstIndex(of: 0x0A) else {
+                    pending.removeAll(keepingCapacity: false)
+                    break
+                }
+                pending.removeSubrange(...newline)
+                isDiscardingOversizedFrame = false
+                continue
+            }
+            if let newline = pending.firstIndex(of: 0x0A) {
+                if pending[..<newline].count > maximumFrameBytes {
+                    didExceedMaximumFrameBytes = true
+                    pending.removeSubrange(...newline)
+                    continue
+                }
+                var line = Data(pending[..<newline])
+                pending.removeSubrange(...newline)
+                if line.last == 0x0D { line.removeLast() }
+                if !line.isEmpty { lines.append(line) }
+                continue
+            }
+            if pending.count > maximumFrameBytes {
+                didExceedMaximumFrameBytes = true
+                pending.removeAll(keepingCapacity: false)
+                isDiscardingOversizedFrame = true
+            }
+            break
+        }
+        return .init(
+            lines: lines,
+            didExceedMaximumFrameBytes: didExceedMaximumFrameBytes
+        )
+    }
+}
+
+struct JSONLineFramerOutput {
+    let lines: [Data]
+    let didExceedMaximumFrameBytes: Bool
 }

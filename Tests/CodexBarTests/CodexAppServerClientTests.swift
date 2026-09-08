@@ -4,6 +4,32 @@ import XCTest
 @testable import CodexBar
 
 final class CodexAppServerClientTests: XCTestCase {
+    func testJSONLineFramerBoundsContinuousFrameAndDiscardsTailUntilLineFeed() {
+        var framer = JSONLineFramer()
+        let chunk = Data(repeating: 0x78, count: 64 * 1024)
+
+        for _ in 0..<16 {
+            let output = framer.consume(chunk)
+            XCTAssertTrue(output.lines.isEmpty)
+            XCTAssertFalse(output.didExceedMaximumFrameBytes)
+            XCTAssertLessThanOrEqual(framer.pendingByteCount, 1024 * 1024)
+        }
+        let overflow = framer.consume(Data([0x78]))
+        let pendingBytesAfterOverflow = framer.pendingByteCount
+        let wasDiscardingAfterOverflow = framer.isDiscardingOversizedFrame
+        let recovery = framer.consume(Data("""
+        tail-must-not-be-a-line
+        {"valid":true}
+
+        """.utf8))
+
+        XCTAssertTrue(overflow.didExceedMaximumFrameBytes)
+        XCTAssertEqual(pendingBytesAfterOverflow, 0)
+        XCTAssertTrue(wasDiscardingAfterOverflow)
+        XCTAssertFalse(framer.isDiscardingOversizedFrame)
+        XCTAssertEqual(recovery.lines.map { String(decoding: $0, as: UTF8.self) }, [#"{"valid":true}"#])
+    }
+
     func testConnectInitializesBeforeSendingInitializedNotification() async throws {
         let rpc = RecordingRPCConnection()
         let client = CodexAppServerClient(connection: rpc)
@@ -301,6 +327,62 @@ final class CodexAppServerClientTests: XCTestCase {
 
         XCTAssertLessThan(lineToTermination, .milliseconds(250))
         XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertFalse(cleanup.isRunning)
+    }
+
+    func testOversizedStdoutFloodIsDiscardedAndTerminatesWithDiagnostic() async throws {
+        let pidMarker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexBarTests-oversized-stdout-\(UUID().uuidString).pid")
+        let escapedPIDMarker = pidMarker.path.replacingOccurrences(of: "'", with: "\\'")
+        let script = try TemporaryNodeScript(source: """
+        const fs = require('fs');
+        fs.writeFileSync('\(escapedPIDMarker)', String(process.pid));
+        const chunk = Buffer.alloc(64 * 1024, 0x78);
+        function flood() {
+          while (process.stdout.write(chunk)) {}
+        }
+        process.stdout.on('drain', flood);
+        flood();
+        setInterval(() => {}, 1000);
+        """)
+        let cleanup = DescendantProcessCleanup(pidFile: pidMarker)
+        defer {
+            cleanup.terminateAndWait()
+            script.remove()
+            try? FileManager.default.removeItem(at: pidMarker)
+        }
+        let transport = ProcessTransport(
+            executableURL: script.url,
+            maximumStdoutFrameBytes: 32 * 1024
+        )
+        let recorder = ProtocolViolationRecorder()
+
+        try await transport.start(
+            onLine: { _ in recorder.recordLine() },
+            onTermination: { recorder.recordTermination($0) }
+        )
+        var terminatedInTime = true
+        do {
+            try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
+        } catch {
+            terminatedInTime = false
+            await transport.stop()
+            try? await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
+        }
+        let exitCode = try XCTUnwrap(recorder.exitCode)
+        let terminationError = await transport.terminationError(for: exitCode)
+        cleanup.terminateAndWait()
+
+        XCTAssertTrue(terminatedInTime)
+        XCTAssertEqual(recorder.lineCount, 0)
+        guard case let .serverExited(errorCode, diagnostic)? = terminationError else {
+            return XCTFail("Expected a controlled oversized-frame termination error")
+        }
+        XCTAssertEqual(errorCode, exitCode)
+        XCTAssertTrue(
+            diagnostic.contains("stdout frame exceeded 32768-byte limit"),
+            "Unexpected diagnostic: \(diagnostic)"
+        )
         XCTAssertFalse(cleanup.isRunning)
     }
 
@@ -640,6 +722,24 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
         lock.withLock {
             if terminationInstant == nil { terminationInstant = clock.now }
         }
+    }
+}
+
+private final class ProtocolViolationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedLineCount = 0
+    private var storedExitCode: Int32?
+
+    var lineCount: Int { lock.withLock { storedLineCount } }
+    var exitCode: Int32? { lock.withLock { storedExitCode } }
+    var hasTerminated: Bool { lock.withLock { storedExitCode != nil } }
+
+    func recordLine() {
+        lock.withLock { storedLineCount += 1 }
+    }
+
+    func recordTermination(_ code: Int32) {
+        lock.withLock { storedExitCode = code }
     }
 }
 
