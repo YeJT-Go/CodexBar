@@ -57,6 +57,11 @@ protocol RPCTransport: Sendable {
     ) async throws
     func write(_ data: Data) async throws
     func stop() async
+    func terminationError(for code: Int32) async -> CodexClientError?
+}
+
+extension RPCTransport {
+    func terminationError(for code: Int32) async -> CodexClientError? { nil }
 }
 
 protocol RPCConnecting: Sendable {
@@ -106,8 +111,8 @@ actor JSONRPCConnection: RPCConnecting {
                 onLine: { [weak self] data in
                     Task { await self?.receive(data) }
                 },
-                onTermination: { [weak self] _ in
-                    Task { await self?.transportDidTerminate(generation: generation) }
+                onTermination: { [weak self] code in
+                    Task { await self?.transportDidTerminate(code: code, generation: generation) }
                 }
             )
             guard lifecycleGeneration == generation, isStarting else {
@@ -232,13 +237,20 @@ actor JSONRPCConnection: RPCConnecting {
         finishRequest(id, with: .failure(JSONRPCError.remote(code: code, message: message)))
     }
 
-    private func transportDidTerminate(generation: Int) {
+    private func transportDidTerminate(code: Int32, generation: Int) async {
+        guard lifecycleGeneration == generation else { return }
+        let terminationError: any Error
+        if let reportedError = await transport.terminationError(for: code) {
+            terminationError = reportedError
+        } else {
+            terminationError = JSONRPCError.disconnected
+        }
         guard lifecycleGeneration == generation else { return }
         lifecycleGeneration += 1
         isStarted = false
         isStarting = false
-        finishStartWaiters(with: .failure(JSONRPCError.disconnected))
-        failAllPending(with: JSONRPCError.disconnected)
+        finishStartWaiters(with: .failure(terminationError))
+        failAllPending(with: terminationError)
     }
 
     private func finishStartWaiters(with result: Result<Void, Error>) {

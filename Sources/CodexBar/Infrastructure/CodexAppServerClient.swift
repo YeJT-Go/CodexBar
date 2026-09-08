@@ -1,0 +1,131 @@
+import Foundation
+
+protocol CodexUsageProviding: Sendable {
+    func connect() async throws
+    func fetchRateLimits() async throws -> RateLimitsResponse
+    func updates() -> AsyncStream<RateLimitsResponse>
+    func stop() async
+}
+
+actor CodexAppServerClient: CodexUsageProviding {
+    private let connection: any RPCConnecting
+    private nonisolated let updateStream: AsyncStream<RateLimitsResponse>
+    private let updateContinuation: AsyncStream<RateLimitsResponse>.Continuation
+    private var isConnected = false
+    private var isStopped = false
+    private var notificationRefreshInFlight = false
+    private var lastNotificationFingerprint: Data?
+    private var lastPublishedResponse: RateLimitsResponse?
+
+    init(connection: any RPCConnecting) {
+        self.connection = connection
+        var capturedContinuation: AsyncStream<RateLimitsResponse>.Continuation?
+        self.updateStream = AsyncStream { continuation in
+            capturedContinuation = continuation
+        }
+        self.updateContinuation = capturedContinuation!
+    }
+
+    init(executableURL: URL) {
+        let transport = ProcessTransport(executableURL: executableURL)
+        self.init(connection: JSONRPCConnection(transport: transport))
+    }
+
+    nonisolated func updates() -> AsyncStream<RateLimitsResponse> {
+        updateStream
+    }
+
+    func connect() async throws {
+        guard !isStopped else { throw CodexClientError.stopped }
+        guard !isConnected else { return }
+
+        await connection.setNotificationHandler { [weak self] method, params in
+            Task { await self?.receiveNotification(method: method, params: params) }
+        }
+        do {
+            try await connection.start()
+            _ = try await connection.request(method: "initialize", params: Self.initializeParams)
+            try await connection.notify(method: "initialized", params: nil)
+            isConnected = true
+        } catch {
+            await connection.setNotificationHandler(nil)
+            await connection.stop()
+            throw error
+        }
+    }
+
+    func fetchRateLimits() async throws -> RateLimitsResponse {
+        guard !isStopped else { throw CodexClientError.stopped }
+        if !isConnected {
+            try await connect()
+        }
+
+        do {
+            return try await requestRateLimits()
+        } catch JSONRPCError.disconnected {
+            isConnected = false
+            try await connect()
+            return try await requestRateLimits()
+        } catch {
+            if error is CodexClientError {
+                isConnected = false
+            }
+            throw error
+        }
+    }
+
+    func stop() async {
+        guard !isStopped else { return }
+        isStopped = true
+        isConnected = false
+        notificationRefreshInFlight = false
+        await connection.setNotificationHandler(nil)
+        await connection.stop()
+        updateContinuation.finish()
+    }
+
+    private func requestRateLimits() async throws -> RateLimitsResponse {
+        let value = try await connection.request(method: "account/rateLimits/read", params: nil)
+        do {
+            let data = try JSONEncoder().encode(value)
+            return try JSONDecoder().decode(RateLimitsResponse.self, from: data)
+        } catch {
+            throw CodexClientError.malformedRateLimitsResponse
+        }
+    }
+
+    private func receiveNotification(method: String, params: JSONValue?) {
+        guard method == "account/rateLimits/updated", !isStopped else { return }
+        let fingerprint = notificationFingerprint(params)
+        guard fingerprint != lastNotificationFingerprint else { return }
+        lastNotificationFingerprint = fingerprint
+        guard !notificationRefreshInFlight else { return }
+        notificationRefreshInFlight = true
+
+        Task { [weak self] in
+            await self?.refreshAfterNotification()
+        }
+    }
+
+    private func refreshAfterNotification() async {
+        defer { notificationRefreshInFlight = false }
+        guard let response = try? await fetchRateLimits(), response != lastPublishedResponse else { return }
+        lastPublishedResponse = response
+        updateContinuation.yield(response)
+    }
+
+    private func notificationFingerprint(_ params: JSONValue?) -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(params ?? .null)) ?? Data()
+    }
+
+    private static let initializeParams: JSONValue = .object([
+        "clientInfo": .object([
+            "name": .string("codex_bar"),
+            "title": .string("CodexBar"),
+            "version": .string("0.1.0")
+        ]),
+        "capabilities": .object(["experimentalApi": .bool(false)])
+    ])
+}
