@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import CodexBar
 
@@ -185,7 +186,7 @@ final class CodexAppServerClientTests: XCTestCase {
 
     func testProcessTransportFramesRealPipeChunksAndAddsNodeSearchPaths() async throws {
         let script = try TemporaryNodeScript(source: #"""
-        process.stdout.write('{"first":1,"sentinel":"' + process.env.CODEX_BAR_SENTINEL + '"}\n{"sec');
+        process.stdout.write(JSON.stringify({path: process.env.PATH, sentinel: process.env.CODEX_BAR_SENTINEL}) + '\n{"sec');
         setTimeout(() => {
           process.stdout.write('ond":2}\n');
           process.exit(0);
@@ -206,8 +207,61 @@ final class CodexAppServerClientTests: XCTestCase {
 
         let strings = await recorder.strings
         let exitCode = await recorder.exitCode
-        XCTAssertEqual(strings, [#"{"first":1,"sentinel":"kept"}"#, #"{"second":2}"#])
+        let environment = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(try XCTUnwrap(strings.first).utf8)) as? [String: String]
+        )
+        let pathDirectories = try XCTUnwrap(environment["path"]).split(separator: ":").map(String.init)
+        XCTAssertTrue(pathDirectories.contains("/opt/homebrew/bin"))
+        XCTAssertTrue(pathDirectories.contains("/usr/local/bin"))
+        XCTAssertEqual(environment["sentinel"], "kept")
+        XCTAssertEqual(strings.dropFirst(), [#"{"second":2}"#])
         XCTAssertEqual(exitCode, 0)
+    }
+
+    func testTerminationDrainIsBoundedWhenDescendantKeepsPipesOpen() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexBarTests-child-finished-\(UUID().uuidString)")
+        let pidMarker = marker.appendingPathExtension("pid")
+        defer {
+            if !FileManager.default.fileExists(atPath: marker.path),
+               let pidData = try? Data(contentsOf: pidMarker),
+               let pid = Int32(String(decoding: pidData, as: UTF8.self)) {
+                _ = Darwin.kill(pid, SIGTERM)
+            }
+            if FileManager.default.fileExists(atPath: marker.path) {
+                try? FileManager.default.removeItem(at: marker)
+            }
+            if FileManager.default.fileExists(atPath: pidMarker.path) {
+                try? FileManager.default.removeItem(at: pidMarker)
+            }
+        }
+        let escapedMarker = marker.path.replacingOccurrences(of: "'", with: "\\'")
+        let escapedPIDMarker = pidMarker.path.replacingOccurrences(of: "'", with: "\\'")
+        let script = try TemporaryNodeScript(source: """
+        const {spawn} = require('child_process');
+        const child = spawn(process.execPath,
+              ['-e', "setTimeout(() => require('fs').writeFileSync('\(escapedMarker)', 'done'), 300)"],
+              {stdio: ['ignore', 'inherit', 'inherit']});
+        require('fs').writeFileSync('\(escapedPIDMarker)', String(child.pid));
+        process.stdout.write('{"beforeExit":true}\\n');
+        process.exit(0);
+        """)
+        defer { script.remove() }
+        let transport = ProcessTransport(executableURL: script.url)
+        let recorder = SynchronousProcessEventRecorder()
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        try await transport.start(
+            onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
+            onTermination: { recorder.appendTermination($0) }
+        )
+        try await waitUntil(timeout: .milliseconds(250)) { recorder.hasTerminated }
+        let terminationElapsed = startedAt.duration(to: clock.now)
+        try await waitUntil(timeout: .seconds(1)) { FileManager.default.fileExists(atPath: marker.path) }
+
+        XCTAssertLessThan(terminationElapsed, .milliseconds(250))
+        XCTAssertEqual(recorder.events, [.line(#"{"beforeExit":true}"#), .termination(0)])
     }
 
     func testImmediateProcessExitDeliversDrainedLineBeforeTermination() async throws {
@@ -306,6 +360,43 @@ final class CodexAppServerClientTests: XCTestCase {
             XCTAssertLessThanOrEqual(stderr.utf8.count, 4096)
             XCTAssertFalse(stderr.contains("boundary-secret"))
             XCTAssertTrue(stderr.contains("[REDACTED OVERSIZED STDERR LINE]"))
+        }
+    }
+
+    func testGenericCredentialKeysAreRedactedWithoutMaskingNaturalLanguageToken() async throws {
+        let script = try TemporaryNodeScript(source: #"""
+        process.stderr.write('The tokenizer reports a token count of 42.\n');
+        process.stderr.write('TOKEN=token-secret\n');
+        process.stderr.write('auth_token: auth-secret\n');
+        process.stderr.write('session_token="session-token-secret"\n');
+        process.stderr.write('{"secret":"json-secret","password":"password-secret","session":"session-secret"}\n');
+        process.stderr.write('X-Session: header-session-secret\n');
+        process.stderr.write('AUTH_TO');
+        setTimeout(() => {
+          process.stderr.write('KEN=cross-chunk-secret\n');
+          process.exit(10);
+        }, 20);
+        """#)
+        defer { script.remove() }
+        let connection = JSONRPCConnection(transport: ProcessTransport(executableURL: script.url))
+        try await connection.start()
+
+        do {
+            _ = try await connection.request(method: "account/rateLimits/read", params: nil)
+            XCTFail("Expected the process exit to fail the pending request")
+        } catch let error as CodexClientError {
+            guard case let .serverExited(code, stderr) = error else {
+                return XCTFail("Unexpected client error: \(error)")
+            }
+            XCTAssertEqual(code, 10)
+            XCTAssertTrue(stderr.contains("The tokenizer reports a token count of 42."))
+            for secret in [
+                "token-secret", "auth-secret", "session-token-secret", "json-secret",
+                "password-secret", "session-secret", "header-session-secret", "cross-chunk-secret"
+            ] {
+                XCTAssertFalse(stderr.contains(secret), "Leaked \(secret)")
+            }
+            XCTAssertLessThanOrEqual(stderr.utf8.count, 4096)
         }
     }
 

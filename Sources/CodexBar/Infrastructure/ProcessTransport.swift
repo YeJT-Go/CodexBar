@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 final class ProcessTransport: RPCTransport, @unchecked Sendable {
     private let executableURL: URL
@@ -55,6 +56,7 @@ final class ProcessTransport: RPCTransport, @unchecked Sendable {
 private final class ProcessTransportState: @unchecked Sendable {
     private static let maximumReportedStderrBytes = 4 * 1024
     private static let maximumPendingStderrLineBytes = 4 * 1024
+    private static let terminationDrainDeadline: TimeInterval = 0.05
 
     private let lock = NSLock()
     private let readCallbackCondition = NSCondition()
@@ -100,26 +102,26 @@ private final class ProcessTransportState: @unchecked Sendable {
             inputHandle = inputPipe.fileHandleForWriting
             outputHandle = outputPipe.fileHandleForReading
             errorHandle = errorPipe.fileHandleForReading
+            makeNonBlocking(outputPipe.fileHandleForReading.fileDescriptor)
+            makeNonBlocking(errorPipe.fileHandleForReading.fileDescriptor)
 
             outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 guard let self, self.beginReadCallback() else { return }
                 defer { self.endReadCallback() }
-                let data = handle.availableData
-                guard !data.isEmpty else {
+                let result = self.readAvailableData(from: handle.fileDescriptor)
+                result.chunks.forEach { self.consumeStdout($0, onLine: onLine) }
+                if result.reachedEOF {
                     handle.readabilityHandler = nil
-                    return
                 }
-                self.consumeStdout(data, onLine: onLine)
             }
             errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 guard let self, self.beginReadCallback() else { return }
                 defer { self.endReadCallback() }
-                let data = handle.availableData
-                guard !data.isEmpty else {
+                let result = self.readAvailableData(from: handle.fileDescriptor)
+                result.chunks.forEach(self.consumeStderr)
+                if result.reachedEOF {
                     handle.readabilityHandler = nil
-                    return
                 }
-                self.consumeStderr(data)
             }
             process.terminationHandler = { [weak self] process in
                 self?.didTerminate(
@@ -233,14 +235,12 @@ private final class ProcessTransportState: @unchecked Sendable {
         handles.1?.readabilityHandler = nil
         waitForReadCallbacksToFinish()
 
-        let remainingStdout = readToEnd(handles.0)
-        let remainingStderr = readToEnd(handles.1)
-        if !remainingStdout.isEmpty {
-            consumeStdout(remainingStdout, onLine: onLine)
-        }
-        if !remainingStderr.isEmpty {
-            consumeStderr(remainingStderr)
-        }
+        drainAvailableData(
+            stdout: handles.0,
+            stderr: handles.1,
+            deadline: ProcessInfo.processInfo.systemUptime + Self.terminationDrainDeadline,
+            onLine: onLine
+        )
 
         lock.withLock {
             if !stderrLineBuffer.isEmpty, !isDiscardingOversizedStderrLine {
@@ -275,6 +275,7 @@ private final class ProcessTransportState: @unchecked Sendable {
             let patterns = [
                 (#"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)[^\s]+"#, "$1[REDACTED]"),
                 (#"(?i)((?:[\"']?)(?:openai_api_key|api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|authorization)(?:[\"']?)\s*[:=]\s*)(?:[\"'][^\"']*[\"']|[^\s,;]+)"#, "$1[REDACTED]"),
+                (#"(?i)((?:[\"']?)(?:(?:[a-z0-9]+[_-])*(?:token|secret|password|session))(?:[\"']?)\s*[:=]\s*)(?:[\"'][^\"']*[\"']|[^\s,;}]+)"#, "$1[REDACTED]"),
                 (#"(?i)((?:set-)?cookie\s*:\s*)[^\r\n]+"#, "$1[REDACTED]")
             ]
             for (pattern, replacement) in patterns {
@@ -298,9 +299,84 @@ private final class ProcessTransportState: @unchecked Sendable {
         stderrBuffer = suffix
     }
 
-    private func readToEnd(_ handle: FileHandle?) -> Data {
-        guard let handle else { return Data() }
-        return (try? handle.readToEnd()) ?? Data()
+    private func drainAvailableData(
+        stdout: FileHandle?,
+        stderr: FileHandle?,
+        deadline: TimeInterval,
+        onLine: @escaping @Sendable (Data) -> Void
+    ) {
+        var sources: [DrainSource] = []
+        if let stdout {
+            sources.append(.init(fileDescriptor: stdout.fileDescriptor) { [weak self] data in
+                self?.consumeStdout(data, onLine: onLine)
+            })
+        }
+        if let stderr {
+            sources.append(.init(fileDescriptor: stderr.fileDescriptor) { [weak self] data in
+                self?.consumeStderr(data)
+            })
+        }
+        for source in sources {
+            makeNonBlocking(source.fileDescriptor)
+        }
+
+        while sources.contains(where: \.isOpen) {
+            var madeProgress = false
+            for index in sources.indices where sources[index].isOpen {
+                let result = readAvailableData(from: sources[index].fileDescriptor)
+                if !result.chunks.isEmpty {
+                    madeProgress = true
+                    result.chunks.forEach(sources[index].consume)
+                }
+                if result.reachedEOF {
+                    sources[index].isOpen = false
+                }
+            }
+
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0, sources.contains(where: \.isOpen) else { break }
+            if madeProgress { continue }
+
+            var descriptors = sources.filter(\.isOpen).map {
+                pollfd(
+                    fd: $0.fileDescriptor,
+                    events: Int16(POLLIN | POLLHUP | POLLERR),
+                    revents: 0
+                )
+            }
+            let timeoutMilliseconds = Int32(max(1, ceil(remaining * 1_000)))
+            guard poll(&descriptors, nfds_t(descriptors.count), timeoutMilliseconds) > 0 else {
+                break
+            }
+        }
+    }
+
+    private func makeNonBlocking(_ fileDescriptor: Int32) {
+        let flags = fcntl(fileDescriptor, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK)
+        }
+    }
+
+    private func readAvailableData(from fileDescriptor: Int32) -> NonBlockingReadResult {
+        var chunks: [Data] = []
+        var buffer = [UInt8](repeating: 0, count: 4 * 1024)
+        while true {
+            let byteCount = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(fileDescriptor, bytes.baseAddress, bytes.count)
+            }
+            if byteCount > 0 {
+                chunks.append(Data(buffer.prefix(byteCount)))
+            } else if byteCount == 0 {
+                return .init(chunks: chunks, reachedEOF: true)
+            } else if errno == EINTR {
+                continue
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .init(chunks: chunks, reachedEOF: false)
+            } else {
+                return .init(chunks: chunks, reachedEOF: true)
+            }
+        }
     }
 
     private func resetReadCallbackCoordination() {
@@ -340,4 +416,15 @@ private final class ProcessTransportState: @unchecked Sendable {
         }
         readCallbackCondition.unlock()
     }
+}
+
+private struct DrainSource {
+    let fileDescriptor: Int32
+    let consume: (Data) -> Void
+    var isOpen = true
+}
+
+private struct NonBlockingReadResult {
+    let chunks: [Data]
+    let reachedEOF: Bool
 }
