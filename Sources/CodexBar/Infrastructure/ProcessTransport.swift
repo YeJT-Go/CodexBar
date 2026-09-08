@@ -57,6 +57,7 @@ private final class ProcessTransportState: @unchecked Sendable {
     private static let maximumReportedStderrBytes = 4 * 1024
     private static let maximumPendingStderrLineBytes = 4 * 1024
     private static let terminationDrainDeadline: TimeInterval = 0.05
+    private static let maximumBytesPerReadPass = 64 * 1024
 
     private let lock = NSLock()
     private let readCallbackCondition = NSCondition()
@@ -108,8 +109,9 @@ private final class ProcessTransportState: @unchecked Sendable {
             outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 guard let self, self.beginReadCallback() else { return }
                 defer { self.endReadCallback() }
-                let result = self.readAvailableData(from: handle.fileDescriptor)
-                result.chunks.forEach { self.consumeStdout($0, onLine: onLine) }
+                let result = self.readAvailableData(from: handle.fileDescriptor) {
+                    self.consumeStdout($0, onLine: onLine)
+                }
                 if result.reachedEOF {
                     handle.readabilityHandler = nil
                 }
@@ -117,8 +119,10 @@ private final class ProcessTransportState: @unchecked Sendable {
             errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 guard let self, self.beginReadCallback() else { return }
                 defer { self.endReadCallback() }
-                let result = self.readAvailableData(from: handle.fileDescriptor)
-                result.chunks.forEach(self.consumeStderr)
+                let result = self.readAvailableData(
+                    from: handle.fileDescriptor,
+                    consume: self.consumeStderr
+                )
                 if result.reachedEOF {
                     handle.readabilityHandler = nil
                 }
@@ -323,10 +327,12 @@ private final class ProcessTransportState: @unchecked Sendable {
         while sources.contains(where: \.isOpen) {
             var madeProgress = false
             for index in sources.indices where sources[index].isOpen {
-                let result = readAvailableData(from: sources[index].fileDescriptor)
-                if !result.chunks.isEmpty {
+                let result = readAvailableData(
+                    from: sources[index].fileDescriptor,
+                    consume: sources[index].consume
+                )
+                if result.bytesRead > 0 {
                     madeProgress = true
-                    result.chunks.forEach(sources[index].consume)
                 }
                 if result.reachedEOF {
                     sources[index].isOpen = false
@@ -358,25 +364,31 @@ private final class ProcessTransportState: @unchecked Sendable {
         }
     }
 
-    private func readAvailableData(from fileDescriptor: Int32) -> NonBlockingReadResult {
-        var chunks: [Data] = []
+    private func readAvailableData(
+        from fileDescriptor: Int32,
+        consume: (Data) -> Void
+    ) -> NonBlockingReadResult {
+        var totalBytesRead = 0
         var buffer = [UInt8](repeating: 0, count: 4 * 1024)
-        while true {
+        while totalBytesRead < Self.maximumBytesPerReadPass {
+            let remainingBudget = Self.maximumBytesPerReadPass - totalBytesRead
             let byteCount = buffer.withUnsafeMutableBytes { bytes in
-                Darwin.read(fileDescriptor, bytes.baseAddress, bytes.count)
+                Darwin.read(fileDescriptor, bytes.baseAddress, min(bytes.count, remainingBudget))
             }
             if byteCount > 0 {
-                chunks.append(Data(buffer.prefix(byteCount)))
+                totalBytesRead += byteCount
+                consume(Data(buffer.prefix(byteCount)))
             } else if byteCount == 0 {
-                return .init(chunks: chunks, reachedEOF: true)
+                return .init(bytesRead: totalBytesRead, reachedEOF: true)
             } else if errno == EINTR {
                 continue
             } else if errno == EAGAIN || errno == EWOULDBLOCK {
-                return .init(chunks: chunks, reachedEOF: false)
+                return .init(bytesRead: totalBytesRead, reachedEOF: false)
             } else {
-                return .init(chunks: chunks, reachedEOF: true)
+                return .init(bytesRead: totalBytesRead, reachedEOF: true)
             }
         }
+        return .init(bytesRead: totalBytesRead, reachedEOF: false)
     }
 
     private func resetReadCallbackCoordination() {
@@ -425,6 +437,6 @@ private struct DrainSource {
 }
 
 private struct NonBlockingReadResult {
-    let chunks: [Data]
+    let bytesRead: Int
     let reachedEOF: Bool
 }

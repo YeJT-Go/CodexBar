@@ -264,6 +264,46 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(recorder.events, [.line(#"{"beforeExit":true}"#), .termination(0)])
     }
 
+    func testTerminationDrainIsBoundedWhileDescendantContinuouslyWrites() async throws {
+        let pidMarker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexBarTests-continuous-child-\(UUID().uuidString).pid")
+        let escapedPIDMarker = pidMarker.path.replacingOccurrences(of: "'", with: "\\'")
+        let parent = try TemporaryNodeScript(source: """
+        const {spawn} = require('child_process');
+        const fs = require('fs');
+        process.stdout.write('{"beforeContinuousWrite":true}\\n');
+        const writers = spawn('/bin/sh', ['-c',
+              "/usr/bin/yes '{\\\"noise\\\":true}' & /usr/bin/yes 'TOKEN=continuous-secret' >&2 & wait"],
+              {stdio: ['ignore', 'inherit', 'inherit'], detached: true});
+        fs.writeFileSync('\(escapedPIDMarker)', String(writers.pid));
+        writers.on('spawn', () => {
+          setTimeout(() => process.exit(0), 20);
+        });
+        """)
+        let cleanup = DescendantProcessCleanup(pidFile: pidMarker, targetsProcessGroup: true)
+        defer {
+            cleanup.terminateAndWait()
+            parent.remove()
+            if FileManager.default.fileExists(atPath: pidMarker.path) {
+                try? FileManager.default.removeItem(at: pidMarker)
+            }
+        }
+        let transport = ProcessTransport(executableURL: parent.url)
+        let recorder = BoundedTerminationRecorder(expectedLine: #"{"beforeContinuousWrite":true}"#)
+
+        try await transport.start(
+            onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
+            onTermination: { recorder.appendTermination($0) }
+        )
+        try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
+        let lineToTermination = try XCTUnwrap(recorder.lineToTerminationDuration)
+        cleanup.terminateAndWait()
+
+        XCTAssertLessThan(lineToTermination, .milliseconds(250))
+        XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertFalse(cleanup.isRunning)
+    }
+
     func testImmediateProcessExitDeliversDrainedLineBeforeTermination() async throws {
         let script = try TemporaryNodeScript(source: #"""
         process.stdout.write('{"last":true}\n');
@@ -561,6 +601,91 @@ private final class SynchronousProcessEventRecorder: @unchecked Sendable {
 
     func appendTermination(_ code: Int32) {
         lock.withLock { storedEvents.append(.termination(code)) }
+    }
+}
+
+private final class BoundedTerminationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let expectedLine: String
+    private let clock = ContinuousClock()
+    private var lineInstant: ContinuousClock.Instant?
+    private var terminationInstant: ContinuousClock.Instant?
+
+    init(expectedLine: String) {
+        self.expectedLine = expectedLine
+    }
+
+    var hasTerminated: Bool { lock.withLock { terminationInstant != nil } }
+    var expectedLinePrecededTermination: Bool {
+        lock.withLock {
+            guard let lineInstant, let terminationInstant else { return false }
+            return lineInstant < terminationInstant
+        }
+    }
+    var lineToTerminationDuration: Duration? {
+        lock.withLock {
+            guard let lineInstant, let terminationInstant else { return nil }
+            return lineInstant.duration(to: terminationInstant)
+        }
+    }
+
+    func appendLine(_ line: String) {
+        guard line == expectedLine else { return }
+        lock.withLock {
+            if lineInstant == nil { lineInstant = clock.now }
+        }
+    }
+
+    func appendTermination(_: Int32) {
+        lock.withLock {
+            if terminationInstant == nil { terminationInstant = clock.now }
+        }
+    }
+}
+
+private final class DescendantProcessCleanup: @unchecked Sendable {
+    private let pidFile: URL
+    private let targetsProcessGroup: Bool
+
+    init(pidFile: URL, targetsProcessGroup: Bool = false) {
+        self.pidFile = pidFile
+        self.targetsProcessGroup = targetsProcessGroup
+    }
+
+    var isRunning: Bool {
+        guard let pid else { return false }
+        return Darwin.kill(signalTarget(for: pid), 0) == 0 || errno == EPERM
+    }
+
+    func terminateAndWait() {
+        guard let pid, pid > 1 else { return }
+        let target = signalTarget(for: pid)
+        if Darwin.kill(target, 0) == 0 || errno == EPERM {
+            _ = Darwin.kill(target, SIGTERM)
+            waitForExit(pid: pid, timeout: 0.25)
+        }
+        if Darwin.kill(target, 0) == 0 || errno == EPERM {
+            _ = Darwin.kill(target, SIGKILL)
+            waitForExit(pid: pid, timeout: 0.25)
+        }
+    }
+
+    private var pid: Int32? {
+        guard let data = try? Data(contentsOf: pidFile) else { return nil }
+        return Int32(String(decoding: data, as: UTF8.self))
+    }
+
+    private func waitForExit(pid: Int32, timeout: TimeInterval) {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        let target = signalTarget(for: pid)
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if Darwin.kill(target, 0) != 0, errno == ESRCH { return }
+            usleep(5_000)
+        }
+    }
+
+    private func signalTarget(for pid: Int32) -> Int32 {
+        targetsProcessGroup ? -pid : pid
     }
 }
 
