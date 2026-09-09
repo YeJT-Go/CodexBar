@@ -40,8 +40,9 @@ staging_dir=""
 backup_dir=""
 staged_app=""
 backup_app=""
-backup_moved=0
-activated=0
+backup_move_started=0
+activation_started=0
+committed=0
 
 is_safe_temporary_dir() {
     local path="$1"
@@ -70,23 +71,47 @@ remove_destination_app() {
     rm -rf -- "$destination_app"
 }
 
+is_complete_app() {
+    local app="$1"
+    [[ -d "$app" ]] &&
+        [[ -x "$app/Contents/MacOS/CodexBar" ]] &&
+        [[ -f "$app/Contents/Info.plist" ]] &&
+        plutil -lint "$app/Contents/Info.plist" >/dev/null 2>&1 &&
+        codesign --verify --deep --strict "$app" >/dev/null 2>&1
+}
+
+run_hook() {
+    local point="$1"
+    if [[ -n "${CODEXBAR_INSTALL_HOOK:-}" ]]; then
+        "$CODEXBAR_INSTALL_HOOK" "$point" "$$"
+    fi
+}
+
 rollback() {
     local status=$?
     trap - EXIT INT TERM HUP
     set +e
 
-    if [[ "$status" -ne 0 && "$activated" -eq 1 && -e "$destination_app" ]]; then
-        remove_destination_app
+    if [[ "$committed" -eq 1 ]]; then
+        exit "$status"
     fi
-    if [[ "$status" -ne 0 && "$backup_moved" -eq 1 && -e "$backup_app" ]]; then
+
+    if [[ "$status" -ne 0 && "$activation_started" -eq 1 && ! -e "$staged_app" && -e "$destination_app" ]]; then
+        if is_complete_app "$destination_app"; then
+            remove_destination_app
+        elif is_safe_temporary_dir "$staging_dir"; then
+            mv -- "$destination_app" "$staged_app"
+        fi
+    fi
+    if [[ "$status" -ne 0 && "$backup_move_started" -eq 1 && -e "$backup_app" && ! -e "$destination_app" ]]; then
         if mv -- "$backup_app" "$destination_app"; then
-            backup_moved=0
+            backup_move_started=0
         else
             echo "错误：自动恢复失败，旧版本保留在 $backup_app" >&2
         fi
     fi
     remove_temporary_dir "$staging_dir"
-    if [[ "$backup_moved" -eq 0 ]]; then
+    if [[ "$backup_move_started" -eq 0 || ! -e "$backup_app" ]]; then
         remove_temporary_dir "$backup_dir"
     fi
     exit "$status"
@@ -125,16 +150,22 @@ plutil -lint "$staged_app/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict "$staged_app"
 
 if [[ -e "$destination_app" ]]; then
+    backup_move_started=1
     mv -- "$destination_app" "$backup_app"
-    backup_moved=1
+    run_hook "after-backup-move"
 fi
 
+activation_started=1
 mv -- "$staged_app" "$destination_app"
-activated=1
-
-remove_temporary_dir "$staging_dir"
-remove_temporary_dir "$backup_dir"
+committed=1
 trap - EXIT INT TERM HUP
+
+if ! remove_temporary_dir "$staging_dir"; then
+    echo "警告：无法清理暂存目录 $staging_dir" >&2
+fi
+if ! remove_temporary_dir "$backup_dir"; then
+    echo "警告：无法清理旧版本备份 $backup_dir" >&2
+fi
 
 open "$destination_app"
 

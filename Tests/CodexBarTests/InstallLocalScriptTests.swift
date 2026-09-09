@@ -58,6 +58,29 @@ final class InstallLocalScriptTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.destination.appending(path: "new.txt").path))
         XCTAssertNil(try fixture.openedPath())
     }
+
+    func testBackupCleanupFailureKeepsActivatedAppAndOpensOnce() throws {
+        let fixture = try Fixture()
+
+        let result = try fixture.run(home: fixture.home.path, failing: "backup-rm")
+
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.destination.appending(path: "new.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.destination.appending(path: "old.txt").path))
+        XCTAssertEqual(try fixture.openedPaths().count, 1)
+        XCTAssertTrue(try fixture.backupContainsOldApp())
+    }
+
+    func testInterruptAfterBackupMoveRestoresOldAppAndDoesNotOpen() throws {
+        let fixture = try Fixture()
+
+        let result = try fixture.run(home: fixture.home.path, interruptAfterBackupMove: true)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.destination.appending(path: "old.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.destination.appending(path: "new.txt").path))
+        XCTAssertNil(try fixture.openedPath())
+    }
 }
 
 private struct InstallerResult {
@@ -110,7 +133,7 @@ private final class Fixture {
         try? FileManager.default.removeItem(at: root)
     }
 
-    func run(home: String, failing: String = "") throws -> InstallerResult {
+    func run(home: String, failing: String = "", interruptAfterBackupMove: Bool = false) throws -> InstallerResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [Self.projectRoot.appending(path: "scripts/install-local.sh").path]
@@ -120,6 +143,7 @@ private final class Fixture {
             "CODEXBAR_SOURCE_APP": source.path,
             "CODEXBAR_TEST_FAIL": failing,
             "CODEXBAR_TEST_STATE": state.path,
+            "CODEXBAR_INSTALL_HOOK": interruptAfterBackupMove ? fakeBin.appending(path: "hook").path : "",
         ]
         let output = Pipe()
         process.standardOutput = output
@@ -134,6 +158,20 @@ private final class Fixture {
         let log = state.appending(path: "opened")
         guard FileManager.default.fileExists(atPath: log.path) else { return nil }
         return try String(contentsOf: log, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func openedPaths() throws -> [String] {
+        guard let contents = try openedPath() else { return [] }
+        return contents.split(separator: "\n").map(String.init)
+    }
+
+    func backupContainsOldApp() throws -> Bool {
+        let applications = home.appending(path: "Applications")
+        let entries = try FileManager.default.contentsOfDirectory(at: applications, includingPropertiesForKeys: nil)
+        return entries.contains { entry in
+            entry.lastPathComponent.hasPrefix(".CodexBar.backup.") &&
+                FileManager.default.fileExists(atPath: entry.appending(path: "CodexBar.app/old.txt").path)
+        }
     }
 
     private func writeFakeCommands() throws {
@@ -155,7 +193,17 @@ private final class Fixture {
         exec /bin/mv "$@"
         """)
         try writeCommand(name: "open", body: """
-        printf '%s\n' "$1" > "$CODEXBAR_TEST_STATE/opened"
+        printf '%s\n' "$1" >> "$CODEXBAR_TEST_STATE/opened"
+        exit 0
+        """)
+        try writeCommand(name: "rm", body: """
+        last=""
+        for argument in "$@"; do last="$argument"; done
+        if [[ "$CODEXBAR_TEST_FAIL" == "backup-rm" && "$last" == */.CodexBar.backup.* ]]; then exit 44; fi
+        exec /bin/rm "$@"
+        """)
+        try writeCommand(name: "hook", body: """
+        if [[ "$1" == "after-backup-move" ]]; then kill -TERM "$2"; fi
         exit 0
         """)
     }
