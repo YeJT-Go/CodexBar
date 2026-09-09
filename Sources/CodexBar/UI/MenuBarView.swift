@@ -119,9 +119,15 @@ struct MenuBarLabel: View {
 struct MenuBarView: View {
     @ObservedObject var model: UsageViewModel
     @StateObject private var loginItem: LoginItemController
+    let lifecycle: AppLifecycleCoordinator
 
-    init(model: UsageViewModel, loginItems: any LoginItemManaging) {
+    init(
+        model: UsageViewModel,
+        loginItems: any LoginItemManaging,
+        lifecycle: AppLifecycleCoordinator
+    ) {
         self.model = model
+        self.lifecycle = lifecycle
         _loginItem = StateObject(wrappedValue: LoginItemController(manager: loginItems))
     }
 
@@ -169,13 +175,14 @@ struct MenuBarView: View {
             Divider()
 
             Button("退出 CodexBar") {
-                NSApplication.shared.terminate(nil)
+                Task { await lifecycle.quit() }
             }
             .buttonStyle(.plain)
             .keyboardShortcut("q")
         }
         .padding(16)
         .frame(width: 330)
+        .onAppear { loginItem.synchronize() }
     }
 }
 

@@ -35,10 +35,21 @@ final class LoginItemController: ObservableObject {
         do {
             try manager.setEnabled(enabled)
             isEnabled = manager.isEnabled
-            errorMessage = nil
+            if isEnabled == enabled {
+                errorMessage = nil
+            } else if enabled {
+                errorMessage = "登录项尚未启用，请前往“系统设置 > 通用 > 登录项”允许 CodexBar。"
+            } else {
+                errorMessage = "登录项仍处于启用状态，请前往“系统设置 > 通用 > 登录项”关闭 CodexBar。"
+            }
         } catch {
             isEnabled = manager.isEnabled
             errorMessage = "无法更新登录项：\(error.localizedDescription)"
         }
+    }
+
+    func synchronize() {
+        isEnabled = manager.isEnabled
+        errorMessage = nil
     }
 }

@@ -2,14 +2,32 @@ import SwiftUI
 
 @main
 struct CodexBarApp: App {
-    @StateObject private var model = AppDependencies.makeUsageViewModel()
+    @NSApplicationDelegateAdaptor(CodexBarApplicationDelegate.self) private var appDelegate
+    @StateObject private var model: UsageViewModel
+    @StateObject private var lifecycle: AppLifecycleCoordinator
+
+    init() {
+        let model = AppDependencies.makeUsageViewModel()
+        _model = StateObject(wrappedValue: model)
+        _lifecycle = StateObject(wrappedValue: AppLifecycleCoordinator(
+            usage: model,
+            terminator: ApplicationTerminator()
+        ))
+    }
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(model: model, loginItems: LoginItemManager())
+            MenuBarView(
+                model: model,
+                loginItems: LoginItemManager(),
+                lifecycle: lifecycle
+            )
         } label: {
             MenuBarLabel(presentation: .make(from: model.state))
-                .task { model.start() }
+                .task {
+                    appDelegate.lifecycle = lifecycle
+                    lifecycle.start()
+                }
         }
         .menuBarExtraStyle(.window)
     }
