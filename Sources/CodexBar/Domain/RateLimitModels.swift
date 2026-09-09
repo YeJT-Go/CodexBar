@@ -27,7 +27,7 @@ struct UsageWindow: Codable, Equatable, Sendable {
 }
 
 struct UsageSnapshot: Codable, Equatable, Sendable {
-    let fiveHour: UsageWindow
+    let fiveHour: UsageWindow?
     let weekly: UsageWindow
     let fetchedAt: Date
 }

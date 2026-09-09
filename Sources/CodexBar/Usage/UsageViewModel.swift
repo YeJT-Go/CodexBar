@@ -18,6 +18,8 @@ final class UsageViewModel: ObservableObject {
     }
 
     @Published private(set) var state: UsageState
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var refreshFeedback: String?
 
     private let client: any CodexUsageProviding
     private let parser: RateLimitParser
@@ -96,6 +98,8 @@ final class UsageViewModel: ObservableObject {
             token = inFlightToken
         } else {
             let client = self.client
+            isRefreshing = true
+            refreshFeedback = "正在获取最新额度…"
             let parser = self.parser
             let now = self.now
             let created = Task<Result<UsageSnapshot, Error>, Never> {
@@ -120,6 +124,7 @@ final class UsageViewModel: ObservableObject {
 
         let result = await task.value
         if activeRefreshToken == token {
+            isRefreshing = false
             refreshTask = nil
             activeRefreshToken = nil
         }
@@ -132,7 +137,9 @@ final class UsageViewModel: ObservableObject {
             lastGoodSnapshot = snapshot
             store.save(snapshot)
             state = .current(snapshot)
+            refreshFeedback = "已刷新 · " + snapshot.fetchedAt.formatted(date: .omitted, time: .standard)
         case let .failure(error):
+            refreshFeedback = "刷新失败，请重试"
             publishFailure(error)
             if isRunning, isConnectionFailure(error) {
                 requestReconnect()
@@ -145,6 +152,7 @@ final class UsageViewModel: ObservableObject {
             return
         }
         isRunning = false
+        isRefreshing = false
         lifecycleEpoch += 1
         reconnectRequested = false
         reconnectTask?.cancel()
@@ -240,6 +248,7 @@ final class UsageViewModel: ObservableObject {
     }
 
     private func beginNewLifecycle() {
+        isRefreshing = false
         lifecycleEpoch += 1
         refreshTask?.cancel()
         refreshTask = nil

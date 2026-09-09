@@ -4,6 +4,32 @@ import XCTest
 
 @MainActor
 final class UsageViewModelTests: XCTestCase {
+    func testWeeklyOnlyRefreshReplacesPreviousTwoWindowCache() async {
+        let old = makeSnapshot(fiveHour: 12, weekly: 34, fetchedAt: .distantPast)
+        let store = InMemoryUsageStore(snapshot: old)
+        let response = RateLimitsResponse(
+            rateLimits: .init(
+                limitId: "codex",
+                primary: .init(usedPercent: 0, windowDurationMins: 10_080, resetsAt: nil),
+                secondary: nil
+            ),
+            rateLimitsByLimitId: nil
+        )
+        let model = UsageViewModel(
+            client: FakeUsageProvider(fetchResults: [.success(response)]), store: store
+        )
+
+        await model.refresh()
+
+        guard case let .current(snapshot) = model.state else {
+            return XCTFail("仅周额度应刷新成功，不能继续显示旧缓存已过期")
+        }
+        XCTAssertNil(snapshot.fiveHour)
+        XCTAssertEqual(snapshot.weekly.remainingPercent, 100)
+        XCTAssertEqual(store.load(), snapshot)
+        XCTAssertFalse(model.isRefreshing)
+    }
+
     func testSuccessfulRefreshPublishesCurrentAndSavesFetchedAt() async {
         let store = InMemoryUsageStore()
         let provider = FakeUsageProvider(fetchResults: [.success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75))])
@@ -15,10 +41,12 @@ final class UsageViewModelTests: XCTestCase {
         guard case let .current(snapshot) = model.state else {
             return XCTFail("刷新成功后应为 current")
         }
-        XCTAssertEqual(snapshot.fiveHour.remainingPercent, 80)
+        XCTAssertEqual(snapshot.fiveHour?.remainingPercent, 80)
         XCTAssertEqual(snapshot.weekly.remainingPercent, 25)
         XCTAssertEqual(snapshot.fetchedAt, now)
         XCTAssertEqual(store.load(), snapshot)
+        XCTAssertFalse(model.isRefreshing)
+        XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
     }
 
     func testFailureKeepsLastGoodSnapshotAsStale() async {
@@ -36,6 +64,8 @@ final class UsageViewModelTests: XCTestCase {
         }
         XCTAssertEqual(snapshot.weekly.remainingPercent, 25)
         XCTAssertFalse(message.isEmpty)
+        XCTAssertFalse(model.isRefreshing)
+        XCTAssertEqual(model.refreshFeedback, "刷新失败，请重试")
     }
 
     func testFailureWithoutCacheIsUnavailableRatherThanZeroPercent() async {
@@ -91,6 +121,8 @@ final class UsageViewModelTests: XCTestCase {
 
         let first = Task { await model.refresh() }
         await eventually { await calls.value == 1 }
+        XCTAssertTrue(model.isRefreshing)
+        XCTAssertEqual(model.refreshFeedback, "正在获取最新额度…")
         let second = Task { await model.refresh() }
         await spin()
         let callsWhileBlocked = await calls.getValue()
@@ -101,6 +133,8 @@ final class UsageViewModelTests: XCTestCase {
         await second.value
         let finalCalls = await calls.getValue()
         XCTAssertEqual(finalCalls, 1)
+        XCTAssertFalse(model.isRefreshing)
+        XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
     }
 
     func testUpdateNotificationTriggersImmediateFullRefresh() async {
@@ -118,18 +152,18 @@ final class UsageViewModelTests: XCTestCase {
         model.start()
         await eventually {
             guard case let .current(value) = model.state else { return false }
-            return provider.fetchCount == 1 && value.fiveHour.remainingPercent == 90
+            return provider.fetchCount == 1 && value.fiveHour?.remainingPercent == 90
         }
         provider.sendUpdate(makeResponse(fiveHourUsed: 99, weeklyUsed: 99))
         await eventually {
             guard case let .current(value) = model.state else { return false }
-            return provider.fetchCount == 2 && value.fiveHour.remainingPercent == 70
+            return provider.fetchCount == 2 && value.fiveHour?.remainingPercent == 70
         }
 
         guard case let .current(value) = model.state else {
             return XCTFail("通知后的完整读取应更新 current")
         }
-        XCTAssertEqual(value.fiveHour.remainingPercent, 70)
+        XCTAssertEqual(value.fiveHour?.remainingPercent, 70)
         await model.stop()
     }
 
@@ -270,7 +304,9 @@ final class UsageViewModelTests: XCTestCase {
 
         let refresh = Task { await model.refresh() }
         await eventually { provider.fetchCount == 1 }
+        XCTAssertTrue(model.isRefreshing)
         await model.stop()
+        XCTAssertFalse(model.isRefreshing)
         await sequence.open(at: 0)
         await refresh.value
 
@@ -303,7 +339,7 @@ final class UsageViewModelTests: XCTestCase {
         guard case let .current(snapshot) = model.state else {
             return XCTFail("新生命周期刷新应成功发布")
         }
-        XCTAssertEqual(snapshot.fiveHour.remainingPercent, 80)
+        XCTAssertEqual(snapshot.fiveHour?.remainingPercent, 80)
         XCTAssertEqual(store.load(), snapshot)
     }
 

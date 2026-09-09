@@ -9,7 +9,7 @@ struct MenuBarWindowPresentation: Equatable, Sendable {
 
 struct MenuBarPresentation: Equatable, Sendable {
     let label: String
-    let fiveHour: MenuBarWindowPresentation
+    let fiveHour: MenuBarWindowPresentation?
     let weekly: MenuBarWindowPresentation
     let fiveHourLevel: UsageLevel
     let weeklyLevel: UsageLevel
@@ -17,11 +17,13 @@ struct MenuBarPresentation: Equatable, Sendable {
     let warningText: String?
     let showsWarning: Bool
 
+    var accentLevel: UsageLevel { fiveHour == nil ? weeklyLevel : fiveHourLevel }
+
     static func make(from state: UsageState) -> Self {
         switch state {
         case .loading:
             return missing(
-                label: "5h -- · 周 --",
+                label: "周 --",
                 connectionText: "正在连接…",
                 warningText: nil
             )
@@ -41,7 +43,7 @@ struct MenuBarPresentation: Equatable, Sendable {
             )
         case let .unavailable(message):
             return missing(
-                label: "⚠ 5h -- · 周 --",
+                label: "⚠ 周 --",
                 connectionText: "不可用",
                 warningText: message
             )
@@ -54,14 +56,14 @@ struct MenuBarPresentation: Equatable, Sendable {
         connectionText: String,
         warningText: String?
     ) -> Self {
-        let fiveHour = window(title: "5 小时", value: snapshot.fiveHour)
+        let fiveHour = snapshot.fiveHour.map { window(title: "5 小时", value: $0) }
         let weekly = window(title: "每周", value: snapshot.weekly)
         let prefix = stale ? "⚠ " : ""
         return Self(
-            label: "\(prefix)5h \(snapshot.fiveHour.remainingPercent)% · 周 \(snapshot.weekly.remainingPercent)%",
+            label: prefix + (snapshot.fiveHour.map { "5h \($0.remainingPercent)% · " } ?? "") + "周 \(snapshot.weekly.remainingPercent)%",
             fiveHour: fiveHour,
             weekly: weekly,
-            fiveHourLevel: stale ? .stale : .level(forRemaining: snapshot.fiveHour.remainingPercent),
+            fiveHourLevel: stale ? .stale : snapshot.fiveHour.map { .level(forRemaining: $0.remainingPercent) } ?? .stale,
             weeklyLevel: stale ? .stale : .level(forRemaining: snapshot.weekly.remainingPercent),
             connectionText: connectionText,
             warningText: warningText,
@@ -76,7 +78,7 @@ struct MenuBarPresentation: Equatable, Sendable {
     ) -> Self {
         Self(
             label: label,
-            fiveHour: .init(title: "5 小时", remainingText: "--", resetText: "未知"),
+            fiveHour: nil,
             weekly: .init(title: "每周", remainingText: "--", resetText: "未知"),
             fiveHourLevel: .stale,
             weeklyLevel: .stale,
@@ -99,20 +101,38 @@ struct MenuBarLabel: View {
     let presentation: MenuBarPresentation
 
     var body: some View {
+        // A non-template image preserves quota colors in the macOS status bar.
+        if let image = renderedLabel {
+            Image(nsImage: image)
+                .renderingMode(.original)
+                .accessibilityLabel(presentation.label)
+        } else {
+            labelContent
+        }
+    }
+
+    @MainActor private var renderedLabel: NSImage? {
+        let renderer = ImageRenderer(content: labelContent.fixedSize())
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let image = renderer.nsImage else { return nil }
+        image.isTemplate = false
+        return image
+    }
+
+    private var labelContent: some View {
         HStack(spacing: 5) {
             if presentation.showsWarning {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .accessibilityLabel("用量数据异常")
             }
             Circle()
-                .fill(presentation.fiveHourLevel.color)
-                .frame(width: 6, height: 6)
-            Circle()
-                .fill(presentation.weeklyLevel.color)
+                .fill(presentation.accentLevel.color)
                 .frame(width: 6, height: 6)
             Text(presentation.label.replacingOccurrences(of: "⚠ ", with: ""))
                 .monospacedDigit()
         }
+        .font(.system(size: 13, weight: .medium))
+        .foregroundStyle(presentation.accentLevel.color)
     }
 }
 
@@ -136,7 +156,9 @@ struct MenuBarView: View {
 
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
-                UsageCard(value: presentation.fiveHour, level: presentation.fiveHourLevel)
+                if let fiveHour = presentation.fiveHour {
+                    UsageCard(value: fiveHour, level: presentation.fiveHourLevel)
+                }
                 UsageCard(value: presentation.weekly, level: presentation.weeklyLevel)
             }
 
@@ -156,9 +178,24 @@ struct MenuBarView: View {
             Button {
                 Task { await model.refresh() }
             } label: {
-                Label("立即刷新", systemImage: "arrow.clockwise")
+                HStack(spacing: 8) {
+                    if model.isRefreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    Text(model.isRefreshing ? "正在刷新…" : "立即刷新")
+                    Spacer()
+                }
+                .padding(.vertical, 4)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderedProminent)
+            .tint(presentation.accentLevel.color)
+            .disabled(model.isRefreshing)
+
+            Text(model.refreshFeedback ?? "等待刷新")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Toggle("登录时自动启动", isOn: Binding(
                 get: { loginItem.isEnabled },
@@ -182,6 +219,12 @@ struct MenuBarView: View {
         }
         .padding(16)
         .frame(width: 330)
+        .background(presentation.accentLevel.color.opacity(0.10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(presentation.accentLevel.color.opacity(0.35), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
         .onAppear { loginItem.synchronize() }
     }
 }

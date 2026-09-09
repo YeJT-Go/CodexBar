@@ -9,7 +9,7 @@ final class RateLimitParserTests: XCTestCase {
             secondary: .init(usedPercent: 75, windowDurationMins: 10_080, resetsAt: 1_789_000_000)
         ), rateLimitsByLimitId: nil)
         let result = try RateLimitParser().parse(response, now: Date(timeIntervalSince1970: 1_788_700_000))
-        XCTAssertEqual(result.fiveHour.remainingPercent, 80)
+        XCTAssertEqual(result.fiveHour?.remainingPercent, 80)
         XCTAssertEqual(result.weekly.remainingPercent, 25)
     }
 
@@ -39,7 +39,7 @@ final class RateLimitParserTests: XCTestCase {
 
         let result = try RateLimitParser().parse(response)
 
-        XCTAssertEqual(result.fiveHour.remainingPercent, 80)
+        XCTAssertEqual(result.fiveHour?.remainingPercent, 80)
         XCTAssertEqual(result.weekly.remainingPercent, 25)
     }
 
@@ -55,11 +55,11 @@ final class RateLimitParserTests: XCTestCase {
 
         let result = try RateLimitParser().parse(response)
 
-        XCTAssertEqual(result.fiveHour.remainingPercent, 70)
+        XCTAssertEqual(result.fiveHour?.remainingPercent, 70)
         XCTAssertEqual(result.weekly.remainingPercent, 40)
     }
 
-    func testThrowsWhenEitherRequiredWindowCannotBeFound() {
+    func testThrowsWhenWeeklyWindowCannotBeFound() {
         let response = RateLimitsResponse(
             rateLimits: .init(
                 limitId: "codex",
@@ -72,5 +72,51 @@ final class RateLimitParserTests: XCTestCase {
         XCTAssertThrowsError(try RateLimitParser().parse(response)) { error in
             XCTAssertEqual(error as? RateLimitParseError, .missingWindow)
         }
+    }
+
+    func testAcceptsWeeklyPrimaryWithoutFiveHourAndDoesNotBorrowSparkWindow() throws {
+        let data = Data("""
+        {
+          "rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 25, "windowDurationMins": 10080},
+            "secondary": null
+          },
+          "rateLimitsByLimitId": {
+            "codex": {
+              "limitId": "codex",
+              "primary": {"usedPercent": 25, "windowDurationMins": 10080},
+              "secondary": null
+            },
+            "codex_spark": {
+              "limitId": "codex_spark",
+              "primary": {"usedPercent": 10, "windowDurationMins": 300},
+              "secondary": {"usedPercent": 20, "windowDurationMins": 10080}
+            }
+          }
+        }
+        """.utf8)
+        let response = try JSONDecoder().decode(RateLimitsResponse.self, from: data)
+
+        let result = try RateLimitParser().parse(response)
+
+        XCTAssertNil(result.fiveHour)
+        XCTAssertEqual(result.weekly.remainingPercent, 75)
+    }
+
+    func testAcceptsWeeklyOnlyLegacyResponseWithoutBucketMap() throws {
+        let response = RateLimitsResponse(
+            rateLimits: .init(
+                limitId: "codex",
+                primary: .init(usedPercent: 0, windowDurationMins: 10_080, resetsAt: nil),
+                secondary: nil
+            ),
+            rateLimitsByLimitId: nil
+        )
+
+        let result = try RateLimitParser().parse(response)
+
+        XCTAssertNil(result.fiveHour)
+        XCTAssertEqual(result.weekly.remainingPercent, 100)
     }
 }

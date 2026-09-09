@@ -7,13 +7,12 @@ enum RateLimitParseError: Error, Equatable {
 struct RateLimitParser: Sendable {
     func parse(_ response: RateLimitsResponse, now: Date = Date()) throws -> UsageSnapshot {
         let snapshot = response.rateLimitsByLimitId?["codex"] ?? response.rateLimits
-        guard let fiveHour = window(for: 300, in: snapshot),
-              let weekly = window(for: 10_080, in: snapshot) else {
+        guard let weekly = window(for: 10_080, in: snapshot) else {
             throw RateLimitParseError.missingWindow
         }
 
         return UsageSnapshot(
-            fiveHour: usageWindow(from: fiveHour),
+            fiveHour: window(for: 300, in: snapshot).map(usageWindow(from:)),
             weekly: usageWindow(from: weekly),
             fetchedAt: now
         )
