@@ -6,6 +6,8 @@
     <string>CodexBar</string>
     <key>CFBundleIdentifier</key>
     <string>local.codexbar.app</string>
+    <key>CFBundleIconFile</key>
+    <string>CodexBar.icns</string>
     <key>CFBundleName</key>
     <string>CodexBar</string>
     <key>CFBundlePackageType</key>

@@ -23,8 +23,10 @@ fi
 
 rm -rf -- "$app_dir"
 mkdir -p "$app_dir/Contents/MacOS"
+mkdir -p "$app_dir/Contents/Resources"
 cp "$binary_path" "$app_dir/Contents/MacOS/CodexBar"
 cp "$project_root/Resources/Info.plist" "$app_dir/Contents/Info.plist"
+cp "$project_root/Resources/CodexBar.icns" "$app_dir/Contents/Resources/CodexBar.icns"
 
 codesign --force --deep --sign - "$app_dir"
 codesign --verify --deep --strict "$app_dir"
