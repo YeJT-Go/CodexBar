@@ -21,10 +21,10 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertFalse(value.showsWarning)
     }
 
-    func testThresholdsUseHealthyAt50WarningAt20AndCriticalBelow20() {
+    func testThresholdsUseApprovedHealthyWarningAndCriticalBoundaries() {
         let snapshot = UsageSnapshot(
-            fiveHour: .init(remainingPercent: 50, resetsAt: nil),
-            weekly: .init(remainingPercent: 20, resetsAt: nil),
+            fiveHour: .init(remainingPercent: 51, resetsAt: nil),
+            weekly: .init(remainingPercent: 21, resetsAt: nil),
             fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
         )
 
@@ -33,13 +33,13 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertEqual(value.fiveHourLevel, .healthy)
         XCTAssertEqual(value.weeklyLevel, .warning)
 
-        let critical = MenuBarPresentation.make(from: .current(.init(
-            fiveHour: .init(remainingPercent: 19, resetsAt: nil),
-            weekly: .init(remainingPercent: 0, resetsAt: nil),
+        let boundaries = MenuBarPresentation.make(from: .current(.init(
+            fiveHour: .init(remainingPercent: 50, resetsAt: nil),
+            weekly: .init(remainingPercent: 20, resetsAt: nil),
             fetchedAt: snapshot.fetchedAt
         )))
-        XCTAssertEqual(critical.fiveHourLevel, .critical)
-        XCTAssertEqual(critical.weeklyLevel, .critical)
+        XCTAssertEqual(boundaries.fiveHourLevel, .warning)
+        XCTAssertEqual(boundaries.weeklyLevel, .critical)
     }
 
     func testStalePresentationKeepsValuesButUsesGrayAndWarningText() {
