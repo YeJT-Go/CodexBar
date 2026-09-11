@@ -99,6 +99,69 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(initializeCount, 2)
     }
 
+    func testFetchAccountUsageDecodesDailyBuckets() async throws {
+        let value: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([
+                .object(["startDate": .string("2026-09-11"), "tokens": .number(184_260)])
+            ])
+        ])
+        let rpc = RecordingRPCConnection(responses: ["account/usage/read": [.success(value)]])
+
+        let response = try await CodexAppServerClient(connection: rpc).fetchAccountUsage()
+
+        XCTAssertEqual(response.dailyUsageBuckets?.first?.tokens, 184_260)
+        let requestCount = await rpc.requestCount(for: "account/usage/read")
+        let events = await rpc.events
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(events.last?.params, nil)
+    }
+
+    func testFetchAccountUsageThrowsMalformedErrorWhenSummaryIsMissing() async throws {
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.success(.object(["dailyUsageBuckets": .array([])]))]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+
+        do {
+            _ = try await client.fetchAccountUsage()
+            XCTFail("缺少 summary 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedAccountUsageResponse)
+        }
+    }
+
+    func testDisconnectedAccountUsageReadReconnectsAndRetriesOnce() async throws {
+        let value: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([])
+        ])
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.failure(JSONRPCError.disconnected), .success(value)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        _ = try await client.fetchAccountUsage()
+
+        let usageReadCount = await rpc.requestCount(for: "account/usage/read")
+        let initializeCount = await rpc.requestCount(for: "initialize")
+        XCTAssertEqual(usageReadCount, 2)
+        XCTAssertEqual(initializeCount, 2)
+    }
+
     func testSparseUpdateRefetchesAndPublishesCompleteSnapshot() async throws {
         let completeResponse = try fixture(namedCodexUsedPercent: 31, fallbackUsedPercent: 88)
         let rpc = RecordingRPCConnection(responses: [

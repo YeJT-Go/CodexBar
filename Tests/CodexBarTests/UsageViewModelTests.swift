@@ -452,6 +452,19 @@ private final class FakeUsageProvider: CodexUsageProviding, @unchecked Sendable 
         }
     }
 
+    func fetchAccountUsage() async throws -> AccountTokenUsageResponse {
+        AccountTokenUsageResponse(
+            summary: .init(
+                lifetimeTokens: nil,
+                peakDailyTokens: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                longestRunningTurnSec: nil
+            ),
+            dailyUsageBuckets: []
+        )
+    }
+
     func updates() -> AsyncStream<RateLimitsResponse> { stream }
 
     func stop() async {
