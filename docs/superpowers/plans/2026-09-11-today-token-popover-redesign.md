@@ -65,7 +65,12 @@ func testMissingTodayBucketMeansZeroWhenBucketsArePresent() throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
     let now = Date(timeIntervalSince1970: 1_789_117_200)
-    let response = AccountTokenUsageResponse(summary: .empty, dailyUsageBuckets: [])
+    let response = AccountTokenUsageResponse(
+        summary: .init(lifetimeTokens: nil, peakDailyTokens: nil,
+                       currentStreakDays: nil, longestStreakDays: nil,
+                       longestRunningTurnSec: nil),
+        dailyUsageBuckets: []
+    )
     XCTAssertEqual(
         try TokenUsageParser().parse(response, now: now, calendar: calendar).tokens,
         0
@@ -106,9 +111,6 @@ struct AccountTokenUsageSummaryDTO: Codable, Equatable, Sendable {
     let currentStreakDays: Int64?
     let longestStreakDays: Int64?
     let longestRunningTurnSec: Int64?
-    static let empty = Self(lifetimeTokens: nil, peakDailyTokens: nil,
-                            currentStreakDays: nil, longestStreakDays: nil,
-                            longestRunningTurnSec: nil)
 }
 
 struct AccountTokenUsageResponse: Codable, Equatable, Sendable {
@@ -147,6 +149,7 @@ git commit -m "feat: model daily Codex token usage"
 - 修改：`Sources/CodexBar/Infrastructure/CodexExecutableLocator.swift`
 - 修改：`Sources/CodexBar/CodexBarApp.swift`
 - 修改：`Tests/CodexBarTests/CodexAppServerClientTests.swift`
+- 修改：`Tests/CodexBarTests/UsageViewModelTests.swift`
 
 **接口：**
 - 消费：Task 1 的 `AccountTokenUsageResponse`。
@@ -201,13 +204,13 @@ protocol CodexUsageProviding: Sendable {
 }
 ```
 
-客户端请求 `account/usage/read`、参数 `nil`，复用现有“断线后 connect 并重试一次”规则；解码失败转换为 `.malformedAccountUsageResponse`。`initialize` 继续发送 `experimentalApi: false`。`UnavailableUsageProvider` 的新方法抛出相同启动错误。
+客户端请求 `account/usage/read`、参数 `nil`，复用现有“断线后 connect 并重试一次”规则；解码失败转换为 `.malformedAccountUsageResponse`。`initialize` 继续发送 `experimentalApi: false`。`UnavailableUsageProvider` 的新方法抛出相同启动错误。为保持本任务可独立编译，在 `UsageViewModelTests` 的假提供者中增加返回空桶响应的 `fetchAccountUsage()`；Task 3 再将其扩展为可配置结果与计数器。
 
 - [ ] **步骤 4：运行聚焦测试并提交**
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter CodexAppServerClientTests
-git add Sources/CodexBar/Infrastructure/CodexAppServerClient.swift Sources/CodexBar/Infrastructure/CodexExecutableLocator.swift Sources/CodexBar/CodexBarApp.swift Tests/CodexBarTests/CodexAppServerClientTests.swift
+git add Sources/CodexBar/Infrastructure/CodexAppServerClient.swift Sources/CodexBar/Infrastructure/CodexExecutableLocator.swift Sources/CodexBar/CodexBarApp.swift Tests/CodexBarTests/CodexAppServerClientTests.swift Tests/CodexBarTests/UsageViewModelTests.swift
 git commit -m "feat: read account token usage"
 ```
 
