@@ -74,4 +74,17 @@ final class TokenUsageParserTests: XCTestCase {
             XCTAssertEqual(error as? TokenUsageParseError, .invalidTokenCount)
         }
     }
+
+    func testThrowsWhenAnyBucketHasInvalidDateKey() {
+        let response = AccountTokenUsageResponse(
+            summary: .init(lifetimeTokens: nil, peakDailyTokens: nil,
+                           currentStreakDays: nil, longestStreakDays: nil,
+                           longestRunningTurnSec: nil),
+            dailyUsageBuckets: [.init(startDate: "2026-02-30", tokens: 1)]
+        )
+
+        XCTAssertThrowsError(try TokenUsageParser().parse(response)) { error in
+            XCTAssertEqual(error as? TokenUsageParseError, .invalidDateKey)
+        }
+    }
 }
