@@ -2,6 +2,52 @@ import XCTest
 @testable import CodexBar
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testTokenPresentationFormatsCurrentValueWithGrouping() {
+        let usage = DailyTokenUsage(
+            tokens: 184_260,
+            dateKey: "2026-09-11",
+            fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
+        )
+
+        let value = TokenUsagePresentation.make(
+            from: .current(usage),
+            locale: Locale(identifier: "en_US")
+        )
+
+        XCTAssertEqual(value.valueText, "184,260 tokens")
+        XCTAssertNil(value.warningText)
+    }
+
+    func testTokenPresentationKeepsLastValueAndWarningWhenStale() {
+        let usage = DailyTokenUsage(
+            tokens: 64_000,
+            dateKey: "2026-09-11",
+            fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
+        )
+
+        let value = TokenUsagePresentation.make(
+            from: .stale(usage, "Token 数据已过期"),
+            locale: Locale(identifier: "en_US")
+        )
+
+        XCTAssertEqual(value.valueText, "64,000 tokens")
+        XCTAssertEqual(value.warningText, "Token 数据已过期")
+    }
+
+    func testTokenPresentationShowsPlaceholderWhileLoading() {
+        let value = TokenUsagePresentation.make(from: .loading)
+
+        XCTAssertEqual(value.valueText, "--")
+        XCTAssertNil(value.warningText)
+    }
+
+    func testTokenPresentationDoesNotInventZeroForUnavailableData() {
+        let value = TokenUsagePresentation.make(from: .unavailable("响应缺少字段"))
+
+        XCTAssertEqual(value.valueText, "--")
+        XCTAssertEqual(value.warningText, "响应缺少字段")
+    }
+
     func testCurrentPresentationContainsBothWindowsAndSemanticLevels() {
         let snapshot = UsageSnapshot(
             fiveHour: .init(remainingPercent: 80, resetsAt: nil),

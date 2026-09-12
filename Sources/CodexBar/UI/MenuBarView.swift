@@ -4,7 +4,38 @@ import SwiftUI
 struct MenuBarWindowPresentation: Equatable, Sendable {
     let title: String
     let remainingText: String
+    let remainingPercent: Int?
     let resetText: String
+}
+
+struct TokenUsagePresentation: Equatable, Sendable {
+    let valueText: String
+    let warningText: String?
+
+    static func make(
+        from state: TokenUsageState,
+        locale: Locale = .current
+    ) -> Self {
+        switch state {
+        case .loading:
+            return .init(valueText: "--", warningText: nil)
+        case let .current(usage):
+            return .init(valueText: formattedValue(usage.tokens, locale: locale), warningText: nil)
+        case let .stale(usage, message):
+            return .init(valueText: formattedValue(usage.tokens, locale: locale), warningText: message)
+        case let .unavailable(message):
+            return .init(valueText: "--", warningText: message)
+        }
+    }
+
+    private static func formattedValue(_ tokens: Int64, locale: Locale) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        let number = formatter.string(from: NSNumber(value: tokens)) ?? String(tokens)
+        return "\(number) tokens"
+    }
 }
 
 struct MenuBarPresentation: Equatable, Sendable {
@@ -79,7 +110,12 @@ struct MenuBarPresentation: Equatable, Sendable {
         Self(
             label: label,
             fiveHour: nil,
-            weekly: .init(title: "每周", remainingText: "--", resetText: "未知"),
+            weekly: .init(
+                title: "每周",
+                remainingText: "--",
+                remainingPercent: nil,
+                resetText: "未知"
+            ),
             fiveHourLevel: .stale,
             weeklyLevel: .stale,
             connectionText: connectionText,
@@ -92,6 +128,7 @@ struct MenuBarPresentation: Equatable, Sendable {
         .init(
             title: title,
             remainingText: "\(value.remainingPercent)%",
+            remainingPercent: value.remainingPercent,
             resetText: value.resetsAt?.formatted(date: .abbreviated, time: .shortened) ?? "未知"
         )
     }
@@ -139,6 +176,7 @@ struct MenuBarLabel: View {
 struct MenuBarView: View {
     @ObservedObject var model: UsageViewModel
     @StateObject private var loginItem: LoginItemController
+    @Environment(\.locale) private var locale
     let lifecycle: AppLifecycleCoordinator
 
     init(
@@ -153,103 +191,138 @@ struct MenuBarView: View {
 
     var body: some View {
         let presentation = MenuBarPresentation.make(from: model.state)
+        let tokenPresentation = TokenUsagePresentation.make(
+            from: model.tokenState,
+            locale: locale
+        )
 
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                if let fiveHour = presentation.fiveHour {
-                    UsageCard(value: fiveHour, level: presentation.fiveHourLevel)
-                }
-                UsageCard(value: presentation.weekly, level: presentation.weeklyLevel)
-            }
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("CodexBar")
+                        .font(.headline)
 
-            Divider()
-
-            Label(presentation.connectionText, systemImage: presentation.showsWarning
-                  ? "exclamationmark.triangle.fill" : "bolt.horizontal.circle")
-                .foregroundStyle(presentation.showsWarning ? Color.secondary : Color.primary)
-
-            if let warning = presentation.warningText {
-                Text(warning)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(presentation.accentLevel.color)
+                            .frame(width: 7, height: 7)
+                        Text(model.refreshFeedback ?? presentation.connectionText)
+                            .lineLimit(2)
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                HStack(spacing: 8) {
-                    if model.isRefreshing {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    Text(model.isRefreshing ? "正在刷新…" : "立即刷新")
-                    Spacer()
                 }
-                .padding(.vertical, 4)
+                Spacer(minLength: 0)
+
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isRefreshing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text(model.isRefreshing ? "刷新中…" : "刷新")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.isRefreshing)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(presentation.accentLevel.color)
-            .disabled(model.isRefreshing)
 
-            Text(model.refreshFeedback ?? "等待刷新")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Toggle("登录时自动启动", isOn: Binding(
-                get: { loginItem.isEnabled },
-                set: { loginItem.setEnabled($0) }
-            ))
-
-            if let error = loginItem.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
+            VStack(alignment: .leading, spacing: 6) {
+                Text("今日使用")
                     .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.secondary)
+                Text(tokenPresentation.valueText)
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.primary)
+
+                if let warning = tokenPresentation.warningText {
+                    InlineWarning(text: warning)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                if let fiveHour = presentation.fiveHour {
+                    QuotaRow(value: fiveHour, level: presentation.fiveHourLevel)
+                    Divider()
+                }
+                QuotaRow(value: presentation.weekly, level: presentation.weeklyLevel)
+            }
+
+            if let warning = presentation.warningText {
+                InlineWarning(text: warning)
             }
 
             Divider()
 
-            Button("退出 CodexBar") {
-                Task { await lifecycle.quit() }
+            HStack(spacing: 16) {
+                Toggle("登录时自动启动", isOn: Binding(
+                    get: { loginItem.isEnabled },
+                    set: { loginItem.setEnabled($0) }
+                ))
+                Spacer(minLength: 0)
+                Button("退出 CodexBar") {
+                    Task { await lifecycle.quit() }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .keyboardShortcut("q")
             }
-            .buttonStyle(.plain)
-            .keyboardShortcut("q")
+
+            if let error = loginItem.errorMessage {
+                InlineWarning(text: error, color: .red)
+            }
         }
-        .padding(16)
-        .frame(width: 330)
-        .background(presentation.accentLevel.color.opacity(0.10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(presentation.accentLevel.color.opacity(0.35), lineWidth: 1)
-                .allowsHitTesting(false)
-        }
+        .padding(18)
+        .frame(width: 350)
         .onAppear { loginItem.synchronize() }
     }
 }
 
-private struct UsageCard: View {
+private struct QuotaRow: View {
     let value: MenuBarWindowPresentation
     let level: UsageLevel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(value.title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value.remainingText)
-                .font(.system(size: 28, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(level.color)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(value.title)
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text(value.remainingText)
+                    .font(.subheadline.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(level.color)
+            }
+
+            ProgressView(value: Double(value.remainingPercent ?? 0), total: 100)
+                .progressViewStyle(.linear)
+                .tint(level.color)
+                .accessibilityLabel("\(value.title)剩余额度")
+                .accessibilityValue(value.remainingText)
+
             Text("重置：\(value.resetText)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct InlineWarning: View {
+    let text: String
+    var color: Color = .secondary
+
+    var body: some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -257,7 +330,7 @@ private extension UsageLevel {
     var color: Color {
         switch self {
         case .healthy: .green
-        case .warning: .orange
+        case .warning: .yellow
         case .critical: .red
         case .stale: .gray
         }
