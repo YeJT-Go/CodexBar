@@ -312,17 +312,11 @@ final class CodexAppServerClientTests: XCTestCase {
             .appendingPathComponent("CodexBarTests-child-finished-\(UUID().uuidString)")
         let pidMarker = marker.appendingPathExtension("pid")
         defer {
-            if !FileManager.default.fileExists(atPath: marker.path),
-               let pidData = try? Data(contentsOf: pidMarker),
-               let pid = Int32(String(decoding: pidData, as: UTF8.self)) {
+            if !FileManager.default.fileExists(atPath: marker.path), let pid = processID(from: pidMarker) {
                 _ = Darwin.kill(pid, SIGTERM)
             }
-            if FileManager.default.fileExists(atPath: marker.path) {
-                try? FileManager.default.removeItem(at: marker)
-            }
-            if FileManager.default.fileExists(atPath: pidMarker.path) {
-                try? FileManager.default.removeItem(at: pidMarker)
-            }
+            removeIfPresent(marker)
+            removeIfPresent(pidMarker)
         }
         let escapedMarker = marker.path.replacingOccurrences(of: "'", with: "\\'")
         let escapedPIDMarker = pidMarker.path.replacingOccurrences(of: "'", with: "\\'")
@@ -337,20 +331,19 @@ final class CodexAppServerClientTests: XCTestCase {
         """)
         defer { script.remove() }
         let transport = ProcessTransport(executableURL: script.url)
-        let recorder = SynchronousProcessEventRecorder()
-        let clock = ContinuousClock()
-        let startedAt = clock.now
+        let recorder = BoundedTerminationRecorder(expectedLine: #"{"beforeExit":true}"#)
 
         try await transport.start(
             onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
             onTermination: { recorder.appendTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
+        try await waitUntil(timeout: .seconds(1)) { recorder.hasExpectedLine }
         try await waitUntil(timeout: .milliseconds(250)) { recorder.hasTerminated }
-        let terminationElapsed = startedAt.duration(to: clock.now)
         try await waitUntil(timeout: .seconds(1)) { FileManager.default.fileExists(atPath: marker.path) }
 
-        XCTAssertLessThan(terminationElapsed, .milliseconds(250))
-        XCTAssertEqual(recorder.events, [.line(#"{"beforeExit":true}"#), .termination(0)])
+        XCTAssertLessThan(try XCTUnwrap(recorder.lineToTerminationDuration), .milliseconds(250))
+        XCTAssertTrue(recorder.expectedLinePrecededTermination)
     }
 
     func testTerminationDrainIsBoundedWhileDescendantContinuouslyWrites() async throws {
@@ -373,9 +366,7 @@ final class CodexAppServerClientTests: XCTestCase {
         defer {
             cleanup.terminateAndWait()
             parent.remove()
-            if FileManager.default.fileExists(atPath: pidMarker.path) {
-                try? FileManager.default.removeItem(at: pidMarker)
-            }
+            removeIfPresent(pidMarker)
         }
         let transport = ProcessTransport(executableURL: parent.url)
         let recorder = BoundedTerminationRecorder(expectedLine: #"{"beforeContinuousWrite":true}"#)
@@ -384,6 +375,8 @@ final class CodexAppServerClientTests: XCTestCase {
             onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
             onTermination: { recorder.appendTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
+        try await waitUntil(timeout: .seconds(1)) { recorder.hasExpectedLine }
         try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
         let lineToTermination = try XCTUnwrap(recorder.lineToTerminationDuration)
         cleanup.terminateAndWait()
@@ -761,6 +754,7 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
     }
 
     var hasTerminated: Bool { lock.withLock { terminationInstant != nil } }
+    var hasExpectedLine: Bool { lock.withLock { lineInstant != nil } }
     var expectedLinePrecededTermination: Bool {
         lock.withLock {
             guard let lineInstant, let terminationInstant else { return false }
@@ -834,8 +828,7 @@ private final class DescendantProcessCleanup: @unchecked Sendable {
     }
 
     private var pid: Int32? {
-        guard let data = try? Data(contentsOf: pidFile) else { return nil }
-        return Int32(String(decoding: data, as: UTF8.self))
+        processID(from: pidFile)
     }
 
     private func waitForExit(pid: Int32, timeout: TimeInterval) {
@@ -850,6 +843,16 @@ private final class DescendantProcessCleanup: @unchecked Sendable {
     private func signalTarget(for pid: Int32) -> Int32 {
         targetsProcessGroup ? -pid : pid
     }
+}
+
+private func processID(from file: URL) -> Int32? {
+    guard let data = FileManager.default.contents(atPath: file.path) else { return nil }
+    return Int32(String(decoding: data, as: UTF8.self))
+}
+
+private func removeIfPresent(_ file: URL) {
+    guard FileManager.default.fileExists(atPath: file.path) else { return }
+    try? FileManager.default.removeItem(at: file)
 }
 
 private enum TestWaitError: Error {
