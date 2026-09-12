@@ -49,6 +49,87 @@ final class UsageViewModelTests: XCTestCase {
         XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
     }
 
+    func testSuccessfulRefreshPublishesQuotaAndTodayTokens() async {
+        let fixedNow = Date(timeIntervalSince1970: 1_789_117_200)
+        let provider = FakeUsageProvider(
+            fetchResults: [.success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75))],
+            tokenResults: [.success(makeTokenResponse(date: "2026-09-11", tokens: 184_260))]
+        )
+        let model = UsageViewModel(
+            client: provider,
+            store: InMemoryUsageStore(),
+            now: { fixedNow }
+        )
+
+        await model.refresh()
+
+        guard case .current = model.state,
+              case let .current(tokenUsage) = model.tokenState else {
+            return XCTFail("额度与 Token 都应成功发布")
+        }
+        XCTAssertEqual(tokenUsage.tokens, 184_260)
+        XCTAssertEqual(tokenUsage.fetchedAt, fixedNow)
+        XCTAssertEqual(provider.fetchCount, 1)
+        XCTAssertEqual(provider.tokenFetchCount, 1)
+    }
+
+    func testTokenFailureDoesNotMakeSuccessfulQuotaStale() async {
+        let provider = FakeUsageProvider(
+            fetchResults: [.success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75))],
+            tokenResults: [.failure(TestFailure.offline)]
+        )
+        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+
+        await model.refresh()
+
+        guard case .current = model.state, case .unavailable = model.tokenState else {
+            return XCTFail("Token 失败必须独立降级")
+        }
+        XCTAssertEqual(model.refreshFeedback, "额度已刷新，Token 暂不可用")
+    }
+
+    func testQuotaFailureDoesNotPreventSuccessfulTokenRefresh() async {
+        let provider = FakeUsageProvider(
+            fetchResults: [.failure(TestFailure.offline)],
+            tokenResults: [.success(makeTokenResponse(date: currentDateKey(), tokens: 42_100))]
+        )
+        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+
+        await model.refresh()
+
+        guard case .unavailable = model.state,
+              case let .current(tokenUsage) = model.tokenState else {
+            return XCTFail("额度失败不应阻止 Token 成功发布")
+        }
+        XCTAssertEqual(tokenUsage.tokens, 42_100)
+        XCTAssertEqual(model.refreshFeedback, "Token 已刷新，额度暂不可用")
+    }
+
+    func testTokenFailureAfterSuccessPublishesLastTokenUsageAsStale() async {
+        let provider = FakeUsageProvider(
+            fetchResults: [
+                .success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75)),
+                .success(makeResponse(fiveHourUsed: 30, weeklyUsed: 70))
+            ],
+            tokenResults: [
+                .success(makeTokenResponse(date: currentDateKey(), tokens: 64_000)),
+                .failure(TestFailure.offline)
+            ]
+        )
+        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+
+        await model.refresh()
+        await model.refresh()
+
+        guard case .current = model.state,
+              case let .stale(tokenUsage, message) = model.tokenState else {
+            return XCTFail("Token 失败时应保留本进程最后一次成功值")
+        }
+        XCTAssertEqual(tokenUsage.tokens, 64_000)
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertEqual(model.refreshFeedback, "额度已刷新，Token 暂不可用")
+    }
+
     func testFailureKeepsLastGoodSnapshotAsStale() async {
         let provider = FakeUsageProvider(fetchResults: [
             .success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75)),
@@ -65,7 +146,7 @@ final class UsageViewModelTests: XCTestCase {
         XCTAssertEqual(snapshot.weekly.remainingPercent, 25)
         XCTAssertFalse(message.isEmpty)
         XCTAssertFalse(model.isRefreshing)
-        XCTAssertEqual(model.refreshFeedback, "刷新失败，请重试")
+        XCTAssertEqual(model.refreshFeedback, "Token 已刷新，额度暂不可用")
     }
 
     func testFailureWithoutCacheIsUnavailableRatherThanZeroPercent() async {
@@ -110,29 +191,34 @@ final class UsageViewModelTests: XCTestCase {
     }
 
     func testConcurrentRefreshesShareOneFetch() async {
-        let gate = AsyncGate()
-        let calls = Counter()
+        let quotaGate = AsyncGate()
+        let tokenGate = AsyncGate()
         let provider = FakeUsageProvider(fetch: {
-            await calls.increment()
-            await gate.wait()
+            await quotaGate.wait()
             return makeResponse(fiveHourUsed: 10, weeklyUsed: 20)
+        }, tokenFetch: {
+            await tokenGate.wait()
+            return makeTokenResponse(date: currentDateKey(), tokens: 800)
         })
         let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
 
         let first = Task { await model.refresh() }
-        await eventually { await calls.value == 1 }
+        await eventually { provider.fetchCount == 1 }
         XCTAssertTrue(model.isRefreshing)
-        XCTAssertEqual(model.refreshFeedback, "正在获取最新额度…")
+        XCTAssertEqual(model.refreshFeedback, "正在获取最新数据…")
         let second = Task { await model.refresh() }
         await spin()
-        let callsWhileBlocked = await calls.getValue()
-        XCTAssertEqual(callsWhileBlocked, 1)
+        XCTAssertEqual(provider.fetchCount, 1)
+        XCTAssertEqual(provider.tokenFetchCount, 0)
 
-        await gate.open()
+        await quotaGate.open()
+        await eventually { provider.tokenFetchCount == 1 }
+        XCTAssertEqual(provider.fetchCount, 1)
+        await tokenGate.open()
         await first.value
         await second.value
-        let finalCalls = await calls.getValue()
-        XCTAssertEqual(finalCalls, 1)
+        XCTAssertEqual(provider.fetchCount, 1)
+        XCTAssertEqual(provider.tokenFetchCount, 1)
         XCTAssertFalse(model.isRefreshing)
         XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
     }
@@ -183,12 +269,22 @@ final class UsageViewModelTests: XCTestCase {
         model.start()
         await eventually {
             let sleepCount = await sleeper.getCallCount()
-            return provider.fetchCount == 1 && sleepCount >= 1
+            guard case .current = model.state, case .current = model.tokenState else {
+                return false
+            }
+            return provider.fetchCount == 1
+                && provider.tokenFetchCount == 1
+                && sleepCount >= 1
+                && !model.isRefreshing
         }
         let firstDuration = await sleeper.getFirstDuration()
         XCTAssertEqual(firstDuration, .seconds(60))
         await sleeper.resumeFirst()
-        await eventually { provider.fetchCount == 2 }
+        await eventually {
+            provider.fetchCount == 2
+                && provider.tokenFetchCount == 2
+                && !model.isRefreshing
+        }
         await model.stop()
     }
 
@@ -314,6 +410,51 @@ final class UsageViewModelTests: XCTestCase {
         XCTAssertNil(store.load())
     }
 
+    func testStopPreventsLateQuotaResultFromPublishingEitherState() async {
+        let quotaGate = AsyncGate()
+        let provider = FakeUsageProvider(fetch: {
+            await quotaGate.wait()
+            return makeResponse(fiveHourUsed: 10, weeklyUsed: 20)
+        }, tokenResults: [
+            .success(makeTokenResponse(date: currentDateKey(), tokens: 1_000))
+        ])
+        let store = InMemoryUsageStore()
+        let model = UsageViewModel(client: provider, store: store)
+
+        let refresh = Task { await model.refresh() }
+        await eventually { provider.fetchCount == 1 }
+        await model.stop()
+        await quotaGate.open()
+        await refresh.value
+
+        XCTAssertEqual(model.state, .loading)
+        XCTAssertEqual(model.tokenState, .loading)
+        XCTAssertNil(store.load())
+    }
+
+    func testStopPreventsLateTokenResultFromPublishingEitherState() async {
+        let tokenGate = AsyncGate()
+        let provider = FakeUsageProvider(
+            fetchResults: [.success(makeResponse(fiveHourUsed: 10, weeklyUsed: 20))],
+            tokenFetch: {
+                await tokenGate.wait()
+                return makeTokenResponse(date: currentDateKey(), tokens: 1_000)
+            }
+        )
+        let store = InMemoryUsageStore()
+        let model = UsageViewModel(client: provider, store: store)
+
+        let refresh = Task { await model.refresh() }
+        await eventually { provider.tokenFetchCount == 1 }
+        await model.stop()
+        await tokenGate.open()
+        await refresh.value
+
+        XCTAssertEqual(model.state, .loading)
+        XCTAssertEqual(model.tokenState, .loading)
+        XCTAssertNil(store.load())
+    }
+
     func testNewLifecycleRefreshIsNeverTemporarilyOverwrittenByOldResult() async {
         let sequence = GatedFetchSequence([
             (AsyncGate(), makeResponse(fiveHourUsed: 90, weeklyUsed: 90)),
@@ -400,6 +541,28 @@ private func makeResponse(fiveHourUsed: Int, weeklyUsed: Int) -> RateLimitsRespo
     )
 }
 
+private func makeTokenResponse(date: String, tokens: Int64) -> AccountTokenUsageResponse {
+    AccountTokenUsageResponse(
+        summary: .init(
+            lifetimeTokens: tokens,
+            peakDailyTokens: tokens,
+            currentStreakDays: 1,
+            longestStreakDays: 1,
+            longestRunningTurnSec: nil
+        ),
+        dailyUsageBuckets: [.init(startDate: date, tokens: tokens)]
+    )
+}
+
+private func currentDateKey() -> String {
+    let formatter = DateFormatter()
+    formatter.calendar = .current
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: Date())
+}
+
 private func makeSnapshot(fiveHour: Int, weekly: Int, fetchedAt: Date) -> UsageSnapshot {
     UsageSnapshot(
         fiveHour: .init(remainingPercent: fiveHour, resetsAt: nil),
@@ -412,21 +575,28 @@ private final class FakeUsageProvider: CodexUsageProviding, @unchecked Sendable 
     private let lock = NSLock()
     private var connectResults: [Result<Void, Error>]
     private var fetchResults: [Result<RateLimitsResponse, Error>]
+    private var tokenResults: [Result<AccountTokenUsageResponse, Error>]
     private let fetchImpl: (@Sendable () async throws -> RateLimitsResponse)?
+    private let tokenFetchImpl: (@Sendable () async throws -> AccountTokenUsageResponse)?
     private let stream: AsyncStream<RateLimitsResponse>
     private let continuation: AsyncStream<RateLimitsResponse>.Continuation
     private(set) var connectCount = 0
     private(set) var fetchCount = 0
+    private(set) var tokenFetchCount = 0
     private(set) var stopCount = 0
 
     init(
         connectResults: [Result<Void, Error>] = [.success(())],
         fetchResults: [Result<RateLimitsResponse, Error>] = [],
-        fetch: (@Sendable () async throws -> RateLimitsResponse)? = nil
+        fetch: (@Sendable () async throws -> RateLimitsResponse)? = nil,
+        tokenResults: [Result<AccountTokenUsageResponse, Error>] = [],
+        tokenFetch: (@Sendable () async throws -> AccountTokenUsageResponse)? = nil
     ) {
         self.connectResults = connectResults
         self.fetchResults = fetchResults
+        self.tokenResults = tokenResults
         self.fetchImpl = fetch
+        self.tokenFetchImpl = tokenFetch
         var captured: AsyncStream<RateLimitsResponse>.Continuation?
         self.stream = AsyncStream { captured = $0 }
         self.continuation = captured!
@@ -453,16 +623,27 @@ private final class FakeUsageProvider: CodexUsageProviding, @unchecked Sendable 
     }
 
     func fetchAccountUsage() async throws -> AccountTokenUsageResponse {
-        AccountTokenUsageResponse(
-            summary: .init(
-                lifetimeTokens: nil,
-                peakDailyTokens: nil,
-                currentStreakDays: nil,
-                longestStreakDays: nil,
-                longestRunningTurnSec: nil
-            ),
-            dailyUsageBuckets: []
-        )
+        let implementation = lock.withLock {
+            () -> (@Sendable () async throws -> AccountTokenUsageResponse)? in
+            tokenFetchCount += 1
+            return tokenFetchImpl
+        }
+        if let implementation { return try await implementation() }
+        return try lock.withLock {
+            if tokenResults.isEmpty {
+                return AccountTokenUsageResponse(
+                    summary: .init(
+                        lifetimeTokens: nil,
+                        peakDailyTokens: nil,
+                        currentStreakDays: nil,
+                        longestStreakDays: nil,
+                        longestRunningTurnSec: nil
+                    ),
+                    dailyUsageBuckets: []
+                )
+            }
+            return try tokenResults.removeFirst().get()
+        }
     }
 
     func updates() -> AsyncStream<RateLimitsResponse> { stream }
@@ -482,12 +663,6 @@ private final class InMemoryUsageStore: UsageStoring, @unchecked Sendable {
     init(snapshot: UsageSnapshot? = nil) { self.snapshot = snapshot }
     func load() -> UsageSnapshot? { lock.withLock { snapshot } }
     func save(_ value: UsageSnapshot) { lock.withLock { snapshot = value } }
-}
-
-private actor Counter {
-    private(set) var value = 0
-    func increment() { value += 1 }
-    func getValue() -> Int { value }
 }
 
 private actor AsyncGate {
