@@ -2,6 +2,28 @@ import XCTest
 @testable import CodexBar
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testWarningColorTokenUsesDeepGoldInLightModeAndBrightYellowInDarkMode() {
+        XCTAssertEqual(
+            UsageColorToken.make(for: .warning, appearance: .light),
+            .deepGold
+        )
+        XCTAssertEqual(
+            UsageColorToken.make(for: .warning, appearance: .dark),
+            .systemYellow
+        )
+    }
+
+    func testNonWarningColorTokensRemainStableAcrossAppearances() {
+        for (level, expected) in [
+            (UsageLevel.healthy, UsageColorToken.systemGreen),
+            (.critical, .systemRed),
+            (.stale, .systemGray),
+        ] {
+            XCTAssertEqual(UsageColorToken.make(for: level, appearance: .light), expected)
+            XCTAssertEqual(UsageColorToken.make(for: level, appearance: .dark), expected)
+        }
+    }
+
     func testTokenPresentationFormatsCurrentValueWithGrouping() {
         let usage = DailyTokenUsage(
             tokens: 184_260,

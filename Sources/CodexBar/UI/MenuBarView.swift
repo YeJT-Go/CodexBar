@@ -1,6 +1,36 @@
 import AppKit
 import SwiftUI
 
+enum UsageAppearance: Equatable, Sendable {
+    case light
+    case dark
+
+    init(colorScheme: ColorScheme) {
+        self = colorScheme == .dark ? .dark : .light
+    }
+}
+
+enum UsageColorToken: Equatable, Sendable {
+    case systemGreen
+    case deepGold
+    case systemYellow
+    case systemRed
+    case systemGray
+
+    static func make(for level: UsageLevel, appearance: UsageAppearance) -> Self {
+        switch level {
+        case .healthy:
+            return .systemGreen
+        case .warning:
+            return appearance == .light ? .deepGold : .systemYellow
+        case .critical:
+            return .systemRed
+        case .stale:
+            return .systemGray
+        }
+    }
+}
+
 struct MenuBarWindowPresentation: Equatable, Sendable {
     let title: String
     let remainingText: String
@@ -136,6 +166,7 @@ struct MenuBarPresentation: Equatable, Sendable {
 
 struct MenuBarLabel: View {
     let presentation: MenuBarPresentation
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         // A non-template image preserves quota colors in the macOS status bar.
@@ -157,19 +188,24 @@ struct MenuBarLabel: View {
     }
 
     private var labelContent: some View {
-        HStack(spacing: 5) {
+        let accentColor = UsageColorToken.make(
+            for: presentation.accentLevel,
+            appearance: UsageAppearance(colorScheme: colorScheme)
+        ).color
+
+        return HStack(spacing: 5) {
             if presentation.showsWarning {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .accessibilityLabel("用量数据异常")
             }
             Circle()
-                .fill(presentation.accentLevel.color)
+                .fill(accentColor)
                 .frame(width: 6, height: 6)
             Text(presentation.label.replacingOccurrences(of: "⚠ ", with: ""))
                 .monospacedDigit()
         }
         .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(presentation.accentLevel.color)
+        .foregroundStyle(accentColor)
     }
 }
 
@@ -177,6 +213,7 @@ struct MenuBarView: View {
     @ObservedObject var model: UsageViewModel
     @StateObject private var loginItem: LoginItemController
     @Environment(\.locale) private var locale
+    @Environment(\.colorScheme) private var colorScheme
     let lifecycle: AppLifecycleCoordinator
 
     init(
@@ -195,6 +232,11 @@ struct MenuBarView: View {
             from: model.tokenState,
             locale: locale
         )
+        let appearance = UsageAppearance(colorScheme: colorScheme)
+        let accentColor = UsageColorToken.make(
+            for: presentation.accentLevel,
+            appearance: appearance
+        ).color
 
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 16) {
@@ -204,7 +246,7 @@ struct MenuBarView: View {
 
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(presentation.accentLevel.color)
+                            .fill(accentColor)
                             .frame(width: 7, height: 7)
                         Text(model.refreshFeedback ?? presentation.connectionText)
                             .lineLimit(2)
@@ -248,10 +290,18 @@ struct MenuBarView: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 if let fiveHour = presentation.fiveHour {
-                    QuotaRow(value: fiveHour, level: presentation.fiveHourLevel)
+                    QuotaRow(
+                        value: fiveHour,
+                        level: presentation.fiveHourLevel,
+                        appearance: appearance
+                    )
                     Divider()
                 }
-                QuotaRow(value: presentation.weekly, level: presentation.weeklyLevel)
+                QuotaRow(
+                    value: presentation.weekly,
+                    level: presentation.weeklyLevel,
+                    appearance: appearance
+                )
             }
 
             if let warning = presentation.warningText {
@@ -287,8 +337,11 @@ struct MenuBarView: View {
 private struct QuotaRow: View {
     let value: MenuBarWindowPresentation
     let level: UsageLevel
+    let appearance: UsageAppearance
 
     var body: some View {
+        let accentColor = UsageColorToken.make(for: level, appearance: appearance).color
+
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(value.title)
@@ -297,12 +350,12 @@ private struct QuotaRow: View {
                 Text(value.remainingText)
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
-                    .foregroundStyle(level.color)
+                    .foregroundStyle(accentColor)
             }
 
             ProgressView(value: Double(value.remainingPercent ?? 0), total: 100)
                 .progressViewStyle(.linear)
-                .tint(level.color)
+                .tint(accentColor)
                 .accessibilityLabel("\(value.title)剩余额度")
                 .accessibilityValue(value.remainingText)
 
@@ -326,13 +379,19 @@ private struct InlineWarning: View {
     }
 }
 
-private extension UsageLevel {
+private extension UsageColorToken {
     var color: Color {
         switch self {
-        case .healthy: .green
-        case .warning: .yellow
-        case .critical: .red
-        case .stale: .gray
+        case .systemGreen:
+            .green
+        case .deepGold:
+            Color(red: 154 / 255, green: 103 / 255, blue: 0)
+        case .systemYellow:
+            .yellow
+        case .systemRed:
+            .red
+        case .systemGray:
+            .gray
         }
     }
 }
