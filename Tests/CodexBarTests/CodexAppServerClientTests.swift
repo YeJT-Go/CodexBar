@@ -344,6 +344,7 @@ final class CodexAppServerClientTests: XCTestCase {
 
         XCTAssertLessThan(try XCTUnwrap(recorder.lineToTerminationDuration), .milliseconds(250))
         XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertEqual(recorder.exitCode, 0)
     }
 
     func testTerminationDrainIsBoundedWhileDescendantContinuouslyWrites() async throws {
@@ -383,6 +384,7 @@ final class CodexAppServerClientTests: XCTestCase {
 
         XCTAssertLessThan(lineToTermination, .milliseconds(250))
         XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertEqual(recorder.exitCode, 0)
         XCTAssertFalse(cleanup.isRunning)
     }
 
@@ -748,6 +750,7 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
     private let clock = ContinuousClock()
     private var lineInstant: ContinuousClock.Instant?
     private var terminationInstant: ContinuousClock.Instant?
+    private var terminationExitCode: Int32?
 
     init(expectedLine: String) {
         self.expectedLine = expectedLine
@@ -755,6 +758,7 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
 
     var hasTerminated: Bool { lock.withLock { terminationInstant != nil } }
     var hasExpectedLine: Bool { lock.withLock { lineInstant != nil } }
+    var exitCode: Int32? { lock.withLock { terminationExitCode } }
     var expectedLinePrecededTermination: Bool {
         lock.withLock {
             guard let lineInstant, let terminationInstant else { return false }
@@ -775,9 +779,12 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
         }
     }
 
-    func appendTermination(_: Int32) {
+    func appendTermination(_ code: Int32) {
         lock.withLock {
-            if terminationInstant == nil { terminationInstant = clock.now }
+            if terminationInstant == nil {
+                terminationInstant = clock.now
+                terminationExitCode = code
+            }
         }
     }
 }
