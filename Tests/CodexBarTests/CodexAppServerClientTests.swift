@@ -462,7 +462,7 @@ final class CodexAppServerClientTests: XCTestCase {
         defer {
             cleanup.terminateAndWait()
             script.remove()
-            try? FileManager.default.removeItem(at: pidMarker)
+            removeIfPresent(pidMarker)
         }
         let transport = ProcessTransport(
             executableURL: script.url,
@@ -474,6 +474,7 @@ final class CodexAppServerClientTests: XCTestCase {
             onLine: { _ in recorder.recordLine() },
             onTermination: { recorder.recordTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
         var terminatedInTime = true
         do {
             try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
