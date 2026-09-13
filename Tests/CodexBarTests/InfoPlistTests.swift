@@ -20,8 +20,14 @@ final class InfoPlistTests: XCTestCase {
         XCTAssertEqual(plist["LSUIElement"] as? Bool, true)
         XCTAssertEqual(plist["LSMinimumSystemVersion"] as? String, "14.0")
         XCTAssertEqual(plist["CFBundleIconFile"] as? String, "CodexBar.icns")
+        XCTAssertEqual(plist["CFBundleIconName"] as? String, "AppIcon")
 
         let iconURL = projectRoot.appending(path: "Resources/CodexBar.icns")
         XCTAssertTrue(FileManager.default.fileExists(atPath: iconURL.path))
+
+        let modernIconURL = projectRoot.appending(
+            path: "Resources/Assets.xcassets/AppIcon.appiconset/Contents.json"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: modernIconURL.path))
     }
 }
