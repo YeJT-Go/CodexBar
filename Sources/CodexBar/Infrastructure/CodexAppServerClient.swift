@@ -68,10 +68,12 @@ actor CodexAppServerClient: CodexUsageProviding {
             isConnected = false
             try await connect()
             return try await requestRateLimits()
-        } catch {
-            if error is CodexClientError {
+        } catch let error as CodexClientError {
+            if case .serverExited = error {
                 isConnected = false
             }
+            throw error
+        } catch {
             throw error
         }
     }
@@ -88,10 +90,12 @@ actor CodexAppServerClient: CodexUsageProviding {
             isConnected = false
             try await connect()
             return try await requestAccountUsage()
-        } catch {
-            if error is CodexClientError {
+        } catch let error as CodexClientError {
+            if case .serverExited = error {
                 isConnected = false
             }
+            throw error
+        } catch {
             throw error
         }
     }

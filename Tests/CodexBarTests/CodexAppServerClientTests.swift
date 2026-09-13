@@ -137,6 +137,61 @@ final class CodexAppServerClientTests: XCTestCase {
         }
     }
 
+    func testMalformedAccountUsageKeepsConnectionForFollowingRateLimitsRead() async throws {
+        let rateLimits = try fixture(namedCodexUsedPercent: 12, fallbackUsedPercent: 91)
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.success(.object(["dailyUsageBuckets": .array([])]))],
+            "account/rateLimits/read": [.success(rateLimits)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        do {
+            _ = try await client.fetchAccountUsage()
+            XCTFail("缺少 summary 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedAccountUsageResponse)
+        }
+
+        let fetched = try await client.fetchRateLimits()
+        let initializeCount = await rpc.requestCount(for: "initialize")
+
+        XCTAssertEqual(fetched.rateLimitsByLimitId?["codex"]?.primary?.usedPercent, 12)
+        XCTAssertEqual(initializeCount, 1)
+    }
+
+    func testMalformedRateLimitsKeepsConnectionForFollowingAccountUsageRead() async throws {
+        let accountUsage: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([])
+        ])
+        let rpc = RecordingRPCConnection(responses: [
+            "account/rateLimits/read": [.success(.object([:]))],
+            "account/usage/read": [.success(accountUsage)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        do {
+            _ = try await client.fetchRateLimits()
+            XCTFail("缺少 rateLimits 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedRateLimitsResponse)
+        }
+
+        let fetched = try await client.fetchAccountUsage()
+        let initializeCount = await rpc.requestCount(for: "initialize")
+
+        XCTAssertEqual(fetched.summary.lifetimeTokens, 184_260)
+        XCTAssertEqual(initializeCount, 1)
+    }
+
     func testDisconnectedAccountUsageReadReconnectsAndRetriesOnce() async throws {
         let value: JSONValue = .object([
             "summary": .object([
