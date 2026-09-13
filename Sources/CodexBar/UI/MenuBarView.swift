@@ -212,7 +212,6 @@ struct MenuBarLabel: View {
 struct MenuBarView: View {
     @ObservedObject var model: UsageViewModel
     @StateObject private var loginItem: LoginItemController
-    @Environment(\.locale) private var locale
     @Environment(\.colorScheme) private var colorScheme
     let lifecycle: AppLifecycleCoordinator
 
@@ -228,10 +227,6 @@ struct MenuBarView: View {
 
     var body: some View {
         let presentation = MenuBarPresentation.make(from: model.state)
-        let tokenPresentation = TokenUsagePresentation.make(
-            from: model.tokenState,
-            locale: locale
-        )
         let appearance = UsageAppearance(colorScheme: colorScheme)
         let accentColor = UsageColorToken.make(
             for: presentation.accentLevel,
@@ -274,33 +269,24 @@ struct MenuBarView: View {
                 .disabled(model.isRefreshing)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("今日使用")
+            VStack(alignment: .leading, spacing: 16) {
+                Text("剩余额度")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(tokenPresentation.valueText)
-                    .font(.system(size: 28, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.primary)
-
-                if let warning = tokenPresentation.warningText {
-                    InlineWarning(text: warning)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 14) {
                 if let fiveHour = presentation.fiveHour {
                     QuotaRow(
                         value: fiveHour,
                         level: presentation.fiveHourLevel,
-                        appearance: appearance
+                        appearance: appearance,
+                        isPrimary: true
                     )
                     Divider()
                 }
                 QuotaRow(
                     value: presentation.weekly,
                     level: presentation.weeklyLevel,
-                    appearance: appearance
+                    appearance: appearance,
+                    isPrimary: presentation.fiveHour == nil
                 )
             }
 
@@ -338,6 +324,7 @@ private struct QuotaRow: View {
     let value: MenuBarWindowPresentation
     let level: UsageLevel
     let appearance: UsageAppearance
+    let isPrimary: Bool
 
     var body: some View {
         let accentColor = UsageColorToken.make(for: level, appearance: appearance).color
@@ -348,7 +335,11 @@ private struct QuotaRow: View {
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Text(value.remainingText)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(
+                        size: isPrimary ? 32 : 26,
+                        weight: .semibold,
+                        design: .rounded
+                    ))
                     .monospacedDigit()
                     .foregroundStyle(accentColor)
             }
@@ -360,7 +351,7 @@ private struct QuotaRow: View {
                 .accessibilityValue(value.remainingText)
 
             Text("重置：\(value.resetText)")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }

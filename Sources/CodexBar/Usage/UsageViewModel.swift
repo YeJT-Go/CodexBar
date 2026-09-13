@@ -14,7 +14,7 @@ final class UsageViewModel: ObservableObject {
 
     private struct RefreshOutcome: @unchecked Sendable {
         let quota: Result<UsageSnapshot, Error>
-        let tokenUsage: Result<DailyTokenUsage, Error>
+        let tokenUsage: Result<DailyTokenUsage, Error>?
     }
 
     private struct RefreshToken: Equatable {
@@ -30,6 +30,7 @@ final class UsageViewModel: ObservableObject {
     private let client: any CodexUsageProviding
     private let parser: RateLimitParser
     private let tokenParser: TokenUsageParser
+    private let tokenUsageEnabled: Bool
     private let store: any UsageStoring
     private let refreshInterval: Duration
     private let sleep: Sleep
@@ -55,6 +56,7 @@ final class UsageViewModel: ObservableObject {
         client: any CodexUsageProviding,
         parser: RateLimitParser = RateLimitParser(),
         tokenParser: TokenUsageParser = TokenUsageParser(),
+        tokenUsageEnabled: Bool = false,
         store: any UsageStoring = UsageStore(),
         refreshInterval: Duration = .seconds(60),
         sleep: @escaping Sleep = { duration in
@@ -66,6 +68,7 @@ final class UsageViewModel: ObservableObject {
         self.client = client
         self.parser = parser
         self.tokenParser = tokenParser
+        self.tokenUsageEnabled = tokenUsageEnabled
         self.store = store
         self.refreshInterval = refreshInterval
         self.sleep = sleep
@@ -113,6 +116,7 @@ final class UsageViewModel: ObservableObject {
             refreshFeedback = "正在获取最新数据…"
             let parser = self.parser
             let tokenParser = self.tokenParser
+            let tokenUsageEnabled = self.tokenUsageEnabled
             let now = self.now
             let created = Task<RefreshOutcome, Never> {
                 let quota: Result<UsageSnapshot, Error>
@@ -123,12 +127,16 @@ final class UsageViewModel: ObservableObject {
                     quota = .failure(error)
                 }
 
-                let tokenUsage: Result<DailyTokenUsage, Error>
-                do {
-                    let response = try await client.fetchAccountUsage()
-                    tokenUsage = .success(try tokenParser.parse(response, now: now()))
-                } catch {
-                    tokenUsage = .failure(error)
+                let tokenUsage: Result<DailyTokenUsage, Error>?
+                if tokenUsageEnabled {
+                    do {
+                        let response = try await client.fetchAccountUsage()
+                        tokenUsage = .success(try tokenParser.parse(response, now: now()))
+                    } catch {
+                        tokenUsage = .failure(error)
+                    }
+                } else {
+                    tokenUsage = nil
                 }
 
                 return RefreshOutcome(quota: quota, tokenUsage: tokenUsage)
@@ -170,29 +178,31 @@ final class UsageViewModel: ObservableObject {
             }
         }
 
-        let tokenSucceeded: Bool
+        let tokenSucceeded: Bool?
         switch outcome.tokenUsage {
-        case let .success(tokenUsage):
+        case let .success(tokenUsage)?:
             tokenSucceeded = true
             lastGoodTokenUsage = tokenUsage
             tokenState = .current(tokenUsage)
-        case let .failure(error):
+        case let .failure(error)?:
             tokenSucceeded = false
             publishTokenFailure(error)
             if isRunning, isConnectionFailure(error) {
                 requestReconnect()
             }
+        case nil:
+            tokenSucceeded = nil
         }
 
         switch (quotaSucceeded, tokenSucceeded) {
-        case (true, true):
+        case (true, true), (true, nil):
             let refreshedAt = lastGoodSnapshot?.fetchedAt ?? now()
             refreshFeedback = "已刷新 · " + refreshedAt.formatted(date: .omitted, time: .standard)
         case (true, false):
             refreshFeedback = "额度已刷新，Token 暂不可用"
         case (false, true):
             refreshFeedback = "Token 已刷新，额度暂不可用"
-        case (false, false):
+        case (false, false), (false, nil):
             refreshFeedback = "刷新失败，请重试"
         }
     }

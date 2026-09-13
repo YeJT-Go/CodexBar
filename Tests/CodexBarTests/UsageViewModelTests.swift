@@ -49,6 +49,24 @@ final class UsageViewModelTests: XCTestCase {
         XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
     }
 
+    func testDefaultRefreshSkipsHiddenTokenUsage() async {
+        let provider = FakeUsageProvider(
+            fetchResults: [.success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75))],
+            tokenResults: [.success(makeTokenResponse(date: currentDateKey(), tokens: 184_260))]
+        )
+        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+
+        await model.refresh()
+
+        guard case .current = model.state else {
+            return XCTFail("隐藏 Token 功能后，额度仍应正常刷新")
+        }
+        XCTAssertEqual(provider.fetchCount, 1)
+        XCTAssertEqual(provider.tokenFetchCount, 0)
+        XCTAssertEqual(model.tokenState, .loading)
+        XCTAssertTrue(model.refreshFeedback?.hasPrefix("已刷新 · ") == true)
+    }
+
     func testSuccessfulRefreshPublishesQuotaAndTodayTokens() async {
         let fixedNow = Date(timeIntervalSince1970: 1_789_117_200)
         let provider = FakeUsageProvider(
@@ -57,6 +75,7 @@ final class UsageViewModelTests: XCTestCase {
         )
         let model = UsageViewModel(
             client: provider,
+            tokenUsageEnabled: true,
             store: InMemoryUsageStore(),
             now: { fixedNow }
         )
@@ -78,7 +97,11 @@ final class UsageViewModelTests: XCTestCase {
             fetchResults: [.success(makeResponse(fiveHourUsed: 20, weeklyUsed: 75))],
             tokenResults: [.failure(TestFailure.offline)]
         )
-        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+        let model = UsageViewModel(
+            client: provider,
+            tokenUsageEnabled: true,
+            store: InMemoryUsageStore()
+        )
 
         await model.refresh()
 
@@ -93,7 +116,11 @@ final class UsageViewModelTests: XCTestCase {
             fetchResults: [.failure(TestFailure.offline)],
             tokenResults: [.success(makeTokenResponse(date: currentDateKey(), tokens: 42_100))]
         )
-        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+        let model = UsageViewModel(
+            client: provider,
+            tokenUsageEnabled: true,
+            store: InMemoryUsageStore()
+        )
 
         await model.refresh()
 
@@ -116,7 +143,11 @@ final class UsageViewModelTests: XCTestCase {
                 .failure(TestFailure.offline)
             ]
         )
-        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+        let model = UsageViewModel(
+            client: provider,
+            tokenUsageEnabled: true,
+            store: InMemoryUsageStore()
+        )
 
         await model.refresh()
         await model.refresh()
@@ -146,7 +177,7 @@ final class UsageViewModelTests: XCTestCase {
         XCTAssertEqual(snapshot.weekly.remainingPercent, 25)
         XCTAssertFalse(message.isEmpty)
         XCTAssertFalse(model.isRefreshing)
-        XCTAssertEqual(model.refreshFeedback, "Token 已刷新，额度暂不可用")
+        XCTAssertEqual(model.refreshFeedback, "刷新失败，请重试")
     }
 
     func testFailureWithoutCacheIsUnavailableRatherThanZeroPercent() async {
@@ -200,7 +231,11 @@ final class UsageViewModelTests: XCTestCase {
             await tokenGate.wait()
             return makeTokenResponse(date: currentDateKey(), tokens: 800)
         })
-        let model = UsageViewModel(client: provider, store: InMemoryUsageStore())
+        let model = UsageViewModel(
+            client: provider,
+            tokenUsageEnabled: true,
+            store: InMemoryUsageStore()
+        )
 
         let first = Task { await model.refresh() }
         await eventually { provider.fetchCount == 1 }
@@ -269,11 +304,9 @@ final class UsageViewModelTests: XCTestCase {
         model.start()
         await eventually {
             let sleepCount = await sleeper.getCallCount()
-            guard case .current = model.state, case .current = model.tokenState else {
-                return false
-            }
+            guard case .current = model.state else { return false }
             return provider.fetchCount == 1
-                && provider.tokenFetchCount == 1
+                && provider.tokenFetchCount == 0
                 && sleepCount >= 1
                 && !model.isRefreshing
         }
@@ -282,7 +315,7 @@ final class UsageViewModelTests: XCTestCase {
         await sleeper.resumeFirst()
         await eventually {
             provider.fetchCount == 2
-                && provider.tokenFetchCount == 2
+                && provider.tokenFetchCount == 0
                 && !model.isRefreshing
         }
         await model.stop()
@@ -415,9 +448,7 @@ final class UsageViewModelTests: XCTestCase {
         let provider = FakeUsageProvider(fetch: {
             await quotaGate.wait()
             return makeResponse(fiveHourUsed: 10, weeklyUsed: 20)
-        }, tokenResults: [
-            .success(makeTokenResponse(date: currentDateKey(), tokens: 1_000))
-        ])
+        })
         let store = InMemoryUsageStore()
         let model = UsageViewModel(client: provider, store: store)
 
@@ -442,7 +473,11 @@ final class UsageViewModelTests: XCTestCase {
             }
         )
         let store = InMemoryUsageStore()
-        let model = UsageViewModel(client: provider, store: store)
+        let model = UsageViewModel(
+            client: provider,
+            tokenUsageEnabled: true,
+            store: store
+        )
 
         let refresh = Task { await model.refresh() }
         await eventually { provider.tokenFetchCount == 1 }
