@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import CodexBar
@@ -144,6 +145,45 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
         XCTAssertFalse(harness.panel.isVisible)
     }
 
+    func testDisconnectedSecondScreenMovesSamePanelToFirstScreenEdge() {
+        let right = FloatingScreen(
+            id: 2,
+            frame: CGRect(x: 1440, y: -100, width: 1280, height: 800),
+            visibleFrame: CGRect(x: 1440, y: -76, width: 1280, height: 776),
+            scale: 1
+        )
+        let harness = makeHarness(pointer: CGPoint(x: 2719, y: 300), screens: [main, right])
+
+        harness.controller.start()
+        XCTAssertEqual(harness.panel.frame.origin.x, 2560)
+
+        harness.environment.screens = [main]
+        harness.environment.mouseLocation = CGPoint(x: 1439, y: 500)
+        harness.environment.send(.screenParametersChanged)
+
+        XCTAssertTrue(harness.panel.isVisible)
+        XCTAssertEqual(harness.panel.showCount, 2)
+        XCTAssertEqual(harness.panel.frame.origin, CGPoint(x: 1280, y: 352))
+    }
+
+    func testReducedTransparencyMaterialRefreshesColorWhenEffectiveAppearanceChanges() throws {
+        let source = MaterialBackgroundSource(color: .systemRed)
+        let materialView = FloatingCardMaterialView {
+            source.resolutionCount += 1
+            return source.color
+        }
+
+        materialView.setReduceTransparency(true)
+        let countAfterEnabling = source.resolutionCount
+        let firstColor = try XCTUnwrap(materialView.layer?.backgroundColor)
+        source.color = .systemBlue
+        materialView.viewDidChangeEffectiveAppearance()
+        let refreshedColor = try XCTUnwrap(materialView.layer?.backgroundColor)
+
+        XCTAssertEqual(source.resolutionCount, countAfterEnabling + 1)
+        XCTAssertNotEqual(refreshedColor, firstColor)
+    }
+
     func testAccessibilityOptionsUpdateStyleAndReduceMotionSkipsFadeDuration() {
         let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
 
@@ -210,6 +250,16 @@ private struct Harness {
     let scheduler: FakeFloatingCardScheduler
     let panel: FakeFloatingCardPanel
     let provider: ControllerNoopUsageProvider
+}
+
+@MainActor
+private final class MaterialBackgroundSource {
+    var color: NSColor
+    var resolutionCount = 0
+
+    init(color: NSColor) {
+        self.color = color
+    }
 }
 
 @MainActor

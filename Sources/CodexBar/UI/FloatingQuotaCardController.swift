@@ -356,14 +356,61 @@ private final class FloatingQuotaPanel: NSPanel {
 }
 
 @MainActor
+final class FloatingCardMaterialView: NSVisualEffectView {
+    typealias OpaqueBackgroundColor = @MainActor () -> NSColor
+
+    private let opaqueBackgroundColor: OpaqueBackgroundColor
+    private var reduceTransparency = false
+
+    init(
+        opaqueBackgroundColor: @escaping OpaqueBackgroundColor = { .windowBackgroundColor }
+    ) {
+        self.opaqueBackgroundColor = opaqueBackgroundColor
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        opaqueBackgroundColor = { .windowBackgroundColor }
+        super.init(coder: coder)
+        wantsLayer = true
+    }
+
+    func setReduceTransparency(_ enabled: Bool) {
+        reduceTransparency = enabled
+        refreshMaterialAppearance()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshMaterialAppearance()
+    }
+
+    private func refreshMaterialAppearance() {
+        guard reduceTransparency else {
+            blendingMode = .behindWindow
+            state = .active
+            layer?.backgroundColor = NSColor.clear.cgColor
+            return
+        }
+
+        blendingMode = .withinWindow
+        state = .inactive
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = opaqueBackgroundColor().cgColor
+        }
+    }
+}
+
+@MainActor
 private final class AppKitFloatingQuotaPanel: FloatingCardPanelPresenting {
     private let panel: FloatingQuotaPanel
-    private let effectView: NSVisualEffectView
+    private let effectView: FloatingCardMaterialView
     private let hostingView: NSHostingView<FloatingQuotaCardView>
 
     init(model: UsageViewModel) {
         hostingView = NSHostingView(rootView: FloatingQuotaCardView(model: model))
-        effectView = NSVisualEffectView()
+        effectView = FloatingCardMaterialView()
         panel = FloatingQuotaPanel(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -421,15 +468,7 @@ private final class AppKitFloatingQuotaPanel: FloatingCardPanelPresenting {
     }
 
     func setReduceTransparency(_ enabled: Bool) {
-        if enabled {
-            effectView.blendingMode = .withinWindow
-            effectView.state = .inactive
-            effectView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        } else {
-            effectView.blendingMode = .behindWindow
-            effectView.state = .active
-            effectView.layer?.backgroundColor = NSColor.clear.cgColor
-        }
+        effectView.setReduceTransparency(enabled)
     }
 
     func fadeOut(
