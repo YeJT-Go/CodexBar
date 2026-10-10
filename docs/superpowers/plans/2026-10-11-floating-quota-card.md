@@ -40,7 +40,7 @@
 
 ---
 
-### 任务 1：浮卡额度展示模型
+### Task 1：浮卡额度展示模型
 
 **文件：**
 - 新建：`Sources/CodexBar/UI/FloatingQuotaPresentation.swift`
@@ -54,7 +54,7 @@
 - [ ] **验证 GREEN：** 重跑筛选测试，预期全部通过。
 - [ ] **提交：** 只提交上述两个文件，消息 `feat: add floating quota presentation`。
 
-### 任务 2：可中断的显示状态机
+### Task 2：可中断的显示状态机
 
 **文件：**
 - 新建：`Sources/CodexBar/UI/FloatingCardVisibilityState.swift`
@@ -68,7 +68,7 @@
 - [ ] **验证 GREEN：** 使用完整 `DEVELOPER_DIR` 重跑筛选测试，预期全部通过。
 - [ ] **提交：** 只提交状态机与测试，消息 `feat: add floating card visibility state`。
 
-### 任务 3：多屏命中与位置计算
+### Task 3：多屏命中与位置计算
 
 **文件：**
 - 新建：`Sources/CodexBar/UI/FloatingCardScreenLayout.swift`
@@ -82,7 +82,7 @@
 - [ ] **验证 GREEN：** 使用完整 `DEVELOPER_DIR` 重跑筛选测试，预期全部通过。
 - [ ] **提交：** 只提交布局与测试，消息 `feat: calculate floating card screen layout`。
 
-### 任务 4：原生材质浮卡视图
+### Task 4：原生材质浮卡视图
 
 **文件：**
 - 新建：`Sources/CodexBar/UI/FloatingQuotaCardView.swift`
@@ -96,7 +96,7 @@
 - [ ] **验证 GREEN：** 运行 `swift test --filter FloatingQuota`，预期任务 1 与任务 4 测试全部通过。
 - [ ] **提交：** 只提交视图与测试，消息 `feat: render floating quota card`。
 
-### 任务 5：NSPanel 控制器与系统事件
+### Task 5：NSPanel 控制器与系统事件
 
 **文件：**
 - 新建：`Sources/CodexBar/UI/FloatingQuotaCardController.swift`
@@ -111,7 +111,7 @@
 - [ ] **验证 GREEN：** 运行 `swift test --filter Floating`，预期全部浮卡测试通过，代码中不出现权限申请 API。
 - [ ] **提交：** 只提交控制器与测试，消息 `feat: coordinate floating quota panel`。
 
-### 任务 6：应用集成、文档与完整验证
+### Task 6：应用集成、文档与完整验证
 
 **文件：**
 - 修改：`Sources/CodexBar/CodexBarApp.swift`
