@@ -110,6 +110,10 @@ final class FloatingQuotaCardController {
 
     private func samplePointer() {
         guard isStarted, !isSleeping else { return }
+        apply(visibilityMachine.handle(.pointerChanged(isInside: pointerIsInsideInteractiveRegion())))
+    }
+
+    private func pointerIsInsideInteractiveRegion() -> Bool {
         let point = environment.mouseLocation
         let screens = environment.screens
 
@@ -117,19 +121,25 @@ final class FloatingQuotaCardController {
            FloatingCardScreenLayout.isInRightEdge(point, of: pointerScreen) {
             activeScreenID = pointerScreen.id
             positionPanel(on: pointerScreen)
-            apply(visibilityMachine.handle(.pointerChanged(isInside: true)))
-            return
+            return true
         }
 
         if let activeScreen = screens.first(where: { $0.id == activeScreenID }) {
             positionPanel(on: activeScreen)
+        } else if activeScreenID != nil {
+            return false
         }
-        let isInsidePanel = panel.isVisible && panel.frame.contains(point)
-        apply(visibilityMachine.handle(.pointerChanged(isInside: isInsidePanel)))
+        return panel.isVisible
+            && FloatingCardScreenLayout.screen(at: point, in: screens) != nil
+            && panel.frame.contains(point)
     }
 
     private func positionPanel(on screen: FloatingScreen) {
-        let size = panel.contentSize
+        let intrinsicSize = panel.contentSize
+        let size = CGSize(
+            width: intrinsicSize.width,
+            height: min(max(0, intrinsicSize.height), max(0, screen.visibleFrame.height))
+        )
         let origin = FloatingCardScreenLayout.panelOrigin(size: size, screen: screen)
         targetFrame = CGRect(origin: origin, size: size)
         panel.move(to: targetFrame)
@@ -179,6 +189,10 @@ final class FloatingQuotaCardController {
                 pendingHide = scheduler.once(after: delay) { [weak self] in
                     guard let self, self.isStarted, !self.isSleeping else { return }
                     self.pendingHide = nil
+                    if self.pointerIsInsideInteractiveRegion() {
+                        self.apply(self.visibilityMachine.handle(.pointerChanged(isInside: true)))
+                        return
+                    }
                     self.apply(self.visibilityMachine.handle(.hideDelayElapsed(token: token)))
                 }
 
@@ -186,6 +200,10 @@ final class FloatingQuotaCardController {
                 let actualDuration = environment.reduceMotion ? 0 : duration
                 panel.fadeOut(duration: actualDuration) { [weak self] in
                     guard let self, self.isStarted, !self.isSleeping else { return }
+                    if self.pointerIsInsideInteractiveRegion() {
+                        self.apply(self.visibilityMachine.handle(.pointerChanged(isInside: true)))
+                        return
+                    }
                     self.apply(self.visibilityMachine.handle(.fadeCompleted(token: token)))
                 }
 
@@ -437,6 +455,7 @@ private final class AppKitFloatingQuotaPanel: FloatingCardPanelPresenting {
         effectView.layer?.masksToBounds = true
 
         hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         effectView.addSubview(hostingView)
         NSLayoutConstraint.activate([
             hostingView.leadingAnchor.constraint(equalTo: effectView.leadingAnchor),

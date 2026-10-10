@@ -45,6 +45,15 @@ final class FloatingQuotaCardViewTests: XCTestCase {
         assertCardSize(.make(from: .stale(snapshot, "连接已断开")))
     }
 
+    func testLongUnavailableMessageIsTruncatedToACompactCardHeight() {
+        let message = String(repeating: "无法获取额度，请检查连接后重试。", count: 80)
+
+        let size = cardSize(.make(from: .unavailable(message)))
+
+        XCTAssertEqual(size.width, 148, accuracy: 0.01)
+        XCTAssertLessThan(size.height, 300)
+    }
+
     private func assertCardSize(
         _ presentation: FloatingQuotaCardPresentation,
         file: StaticString = #filePath,

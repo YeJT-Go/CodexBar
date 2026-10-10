@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 import XCTest
 @testable import CodexBar
 
@@ -114,6 +115,36 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
         XCTAssertTrue(harness.panel.isVisible)
     }
 
+    func testHideDelayCallbackRechecksPointerBeforeStartingFade() {
+        let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
+
+        harness.controller.start()
+        harness.environment.mouseLocation = CGPoint(x: 500, y: 500)
+        harness.scheduler.fireRepeating()
+        harness.environment.mouseLocation = CGPoint(
+            x: harness.panel.frame.midX,
+            y: harness.panel.frame.midY
+        )
+        harness.scheduler.fireOneShot(at: 0)
+
+        XCTAssertTrue(harness.panel.fadeDurations.isEmpty)
+        XCTAssertTrue(harness.panel.isVisible)
+    }
+
+    func testFadeCompletionRechecksEdgeBeforeHiding() {
+        let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
+
+        harness.controller.start()
+        harness.environment.mouseLocation = CGPoint(x: 500, y: 500)
+        harness.scheduler.fireRepeating()
+        harness.scheduler.fireOneShot(at: 0)
+        harness.environment.mouseLocation = CGPoint(x: 1439, y: 500)
+        harness.panel.completeFade(at: 0)
+
+        XCTAssertEqual(harness.panel.restoreDurations, [0.1])
+        XCTAssertTrue(harness.panel.isVisible)
+    }
+
     func testSleepInvalidatesCallbacksAndWakeRestartsSampling() {
         let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
 
@@ -132,6 +163,23 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
         harness.environment.send(.didWake)
 
         XCTAssertEqual(harness.scheduler.repeatingIntervals, [0.1, 0.1])
+        XCTAssertTrue(harness.panel.isVisible)
+    }
+
+    func testSleepDuringFadeMakesOldCompletionHarmlessAfterWake() {
+        let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
+
+        harness.controller.start()
+        harness.environment.mouseLocation = CGPoint(x: 500, y: 500)
+        harness.scheduler.fireRepeating()
+        harness.scheduler.fireOneShot(at: 0)
+        XCTAssertEqual(harness.panel.fadeDurations, [0.25])
+
+        harness.environment.send(.willSleep)
+        harness.environment.mouseLocation = CGPoint(x: 1439, y: 500)
+        harness.environment.send(.didWake)
+        harness.panel.completeFade(at: 0)
+
         XCTAssertTrue(harness.panel.isVisible)
     }
 
@@ -184,6 +232,32 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
         XCTAssertNotEqual(refreshedColor, firstColor)
     }
 
+    func testLongUnavailableMessageOnShortScreenKeepsWholePanelInsideVisibleFrame() {
+        let shortScreen = FloatingScreen(
+            id: 7,
+            frame: CGRect(x: 0, y: 0, width: 800, height: 240),
+            visibleFrame: CGRect(x: 0, y: 40, width: 800, height: 180),
+            scale: 2
+        )
+        let longMessage = String(repeating: "无法获取额度，请检查连接后重试。", count: 80)
+        let contentSize = NSHostingView(
+            rootView: FloatingQuotaCardContent(
+                presentation: .make(from: .unavailable(longMessage))
+            )
+        ).fittingSize
+        let harness = makeHarness(
+            pointer: CGPoint(x: 799, y: 100),
+            screens: [shortScreen],
+            panelContentSize: contentSize
+        )
+
+        harness.controller.start()
+
+        XCTAssertGreaterThan(contentSize.height, shortScreen.visibleFrame.height)
+        XCTAssertGreaterThanOrEqual(harness.panel.frame.minY, shortScreen.visibleFrame.minY)
+        XCTAssertLessThanOrEqual(harness.panel.frame.maxY, shortScreen.visibleFrame.maxY)
+    }
+
     func testAccessibilityOptionsUpdateStyleAndReduceMotionSkipsFadeDuration() {
         let harness = makeHarness(pointer: CGPoint(x: 1439, y: 500))
 
@@ -214,7 +288,8 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
 
     private func makeHarness(
         pointer: CGPoint,
-        screens: [FloatingScreen]? = nil
+        screens: [FloatingScreen]? = nil,
+        panelContentSize: CGSize = CGSize(width: 148, height: 220)
     ) -> Harness {
         let provider = ControllerNoopUsageProvider()
         let model = UsageViewModel(
@@ -226,7 +301,7 @@ final class FloatingQuotaCardControllerTests: XCTestCase {
             screens: screens ?? [main]
         )
         let scheduler = FakeFloatingCardScheduler()
-        let panel = FakeFloatingCardPanel(contentSize: CGSize(width: 148, height: 220))
+        let panel = FakeFloatingCardPanel(contentSize: panelContentSize)
         let controller = FloatingQuotaCardController(
             model: model,
             environment: environment,

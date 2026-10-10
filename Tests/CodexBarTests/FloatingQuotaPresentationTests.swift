@@ -43,7 +43,13 @@ final class FloatingQuotaPresentationTests: XCTestCase {
         )))
 
         XCTAssertEqual(card.fiveHour?.progress, 0)
+        XCTAssertEqual(card.fiveHour?.remainingText, "0%")
+        XCTAssertEqual(card.fiveHour?.accessibilityValue, "0%")
+        XCTAssertEqual(card.fiveHour?.level, .critical)
         XCTAssertEqual(card.weekly.progress, 1)
+        XCTAssertEqual(card.weekly.remainingText, "100%")
+        XCTAssertEqual(card.weekly.accessibilityValue, "100%")
+        XCTAssertEqual(card.weekly.level, .healthy)
     }
 
     func testLoadingPresentationHasNoInventedProgress() {

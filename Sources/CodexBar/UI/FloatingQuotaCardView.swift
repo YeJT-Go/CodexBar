@@ -23,6 +23,8 @@ struct FloatingQuotaCardContent: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

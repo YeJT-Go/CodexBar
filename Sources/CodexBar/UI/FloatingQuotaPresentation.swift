@@ -65,13 +65,13 @@ struct FloatingQuotaCardPresentation: Equatable, Sendable {
     }
 
     private static func ring(title: String, remainingPercent: Int) -> FloatingQuotaRingPresentation {
-        let remainingText = "\(remainingPercent)%"
         let clampedPercent = min(100, max(0, remainingPercent))
+        let remainingText = "\(clampedPercent)%"
         return .init(
             title: title,
             remainingText: remainingText,
             progress: Double(clampedPercent) / 100,
-            level: .level(forRemaining: remainingPercent),
+            level: .level(forRemaining: clampedPercent),
             accessibilityLabel: "\(title)剩余额度",
             accessibilityValue: remainingText
         )
