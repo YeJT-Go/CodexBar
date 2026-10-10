@@ -165,4 +165,17 @@ final class FloatingCardScreenLayoutTests: XCTestCase {
             CGPoint(x: 0.2, y: 0.2)
         )
     }
+
+    func testOversizedCardRemainsAtFractionalMinimumWhenPixelRoundingMovesRight() {
+        let screen = FloatingScreen(
+            id: 1,
+            frame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            visibleFrame: CGRect(x: 0.6, y: 0, width: 999.4, height: 800),
+            scale: 1
+        )
+        XCTAssertEqual(
+            FloatingCardScreenLayout.panelOrigin(size: CGSize(width: 1200, height: 200), screen: screen),
+            CGPoint(x: 0.6, y: 300)
+        )
+    }
 }

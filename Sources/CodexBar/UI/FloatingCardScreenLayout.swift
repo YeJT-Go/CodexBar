@@ -19,6 +19,7 @@ enum FloatingCardScreenLayout {
 
     static func panelOrigin(size: CGSize, screen: FloatingScreen, trailingInset: CGFloat = 12) -> CGPoint {
         let visible = screen.visibleFrame
+        let maximumX = max(visible.minX, visible.maxX - size.width)
         let maximumY = max(visible.minY, visible.maxY - size.height)
         let x = max(visible.minX, visible.maxX - trailingInset - size.width)
         let y = min(max(visible.minY, visible.midY - size.height / 2), maximumY)
@@ -26,7 +27,7 @@ enum FloatingCardScreenLayout {
 
         // Clamp again after rounding so fractional screen bounds remain respected.
         return CGPoint(
-            x: max(visible.minX, (x * scale).rounded() / scale),
+            x: min(max(visible.minX, (x * scale).rounded() / scale), maximumX),
             y: min(max(visible.minY, (y * scale).rounded() / scale), maximumY)
         )
     }
