@@ -3,6 +3,7 @@ import Foundation
 protocol CodexUsageProviding: Sendable {
     func connect() async throws
     func fetchRateLimits() async throws -> RateLimitsResponse
+    func fetchAccountUsage() async throws -> AccountTokenUsageResponse
     func updates() -> AsyncStream<RateLimitsResponse>
     func stop() async
 }
@@ -67,10 +68,34 @@ actor CodexAppServerClient: CodexUsageProviding {
             isConnected = false
             try await connect()
             return try await requestRateLimits()
-        } catch {
-            if error is CodexClientError {
+        } catch let error as CodexClientError {
+            if case .serverExited = error {
                 isConnected = false
             }
+            throw error
+        } catch {
+            throw error
+        }
+    }
+
+    func fetchAccountUsage() async throws -> AccountTokenUsageResponse {
+        guard !isStopped else { throw CodexClientError.stopped }
+        if !isConnected {
+            try await connect()
+        }
+
+        do {
+            return try await requestAccountUsage()
+        } catch JSONRPCError.disconnected {
+            isConnected = false
+            try await connect()
+            return try await requestAccountUsage()
+        } catch let error as CodexClientError {
+            if case .serverExited = error {
+                isConnected = false
+            }
+            throw error
+        } catch {
             throw error
         }
     }
@@ -94,6 +119,16 @@ actor CodexAppServerClient: CodexUsageProviding {
             return try JSONDecoder().decode(RateLimitsResponse.self, from: data)
         } catch {
             throw CodexClientError.malformedRateLimitsResponse
+        }
+    }
+
+    private func requestAccountUsage() async throws -> AccountTokenUsageResponse {
+        let value = try await connection.request(method: "account/usage/read", params: nil)
+        do {
+            let data = try JSONEncoder().encode(value)
+            return try JSONDecoder().decode(AccountTokenUsageResponse.self, from: data)
+        } catch {
+            throw CodexClientError.malformedAccountUsageResponse
         }
     }
 

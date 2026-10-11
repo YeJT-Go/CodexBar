@@ -12,17 +12,25 @@ enum UsageState: Equatable, Sendable {
 final class UsageViewModel: ObservableObject {
     typealias Sleep = @Sendable (Duration) async throws -> Void
 
+    private struct RefreshOutcome: @unchecked Sendable {
+        let quota: Result<UsageSnapshot, Error>
+        let tokenUsage: Result<DailyTokenUsage, Error>?
+    }
+
     private struct RefreshToken: Equatable {
         let lifecycle: Int
         let generation: Int
     }
 
     @Published private(set) var state: UsageState
+    @Published private(set) var tokenState: TokenUsageState
     @Published private(set) var isRefreshing = false
     @Published private(set) var refreshFeedback: String?
 
     private let client: any CodexUsageProviding
     private let parser: RateLimitParser
+    private let tokenParser: TokenUsageParser
+    private let tokenUsageEnabled: Bool
     private let store: any UsageStoring
     private let refreshInterval: Duration
     private let sleep: Sleep
@@ -30,13 +38,14 @@ final class UsageViewModel: ObservableObject {
     private let now: @Sendable () -> Date
 
     private var lastGoodSnapshot: UsageSnapshot?
+    private var lastGoodTokenUsage: DailyTokenUsage?
     private var reconnectTask: Task<Void, Never>?
     private var reconnectGeneration = 0
     private var activeReconnectGeneration: Int?
     private var reconnectRequested = false
     private var timerTask: Task<Void, Never>?
     private var updatesTask: Task<Void, Never>?
-    private var refreshTask: Task<Result<UsageSnapshot, Error>, Never>?
+    private var refreshTask: Task<RefreshOutcome, Never>?
     private var activeRefreshToken: RefreshToken?
     private var latestValidRefreshToken: RefreshToken?
     private var nextRefreshGeneration = 0
@@ -46,6 +55,8 @@ final class UsageViewModel: ObservableObject {
     init(
         client: any CodexUsageProviding,
         parser: RateLimitParser = RateLimitParser(),
+        tokenParser: TokenUsageParser = TokenUsageParser(),
+        tokenUsageEnabled: Bool = false,
         store: any UsageStoring = UsageStore(),
         refreshInterval: Duration = .seconds(60),
         sleep: @escaping Sleep = { duration in
@@ -56,6 +67,8 @@ final class UsageViewModel: ObservableObject {
     ) {
         self.client = client
         self.parser = parser
+        self.tokenParser = tokenParser
+        self.tokenUsageEnabled = tokenUsageEnabled
         self.store = store
         self.refreshInterval = refreshInterval
         self.sleep = sleep
@@ -68,6 +81,7 @@ final class UsageViewModel: ObservableObject {
         } else {
             state = .loading
         }
+        tokenState = .loading
     }
 
     func start() {
@@ -89,7 +103,7 @@ final class UsageViewModel: ObservableObject {
     }
 
     func refresh() async {
-        let task: Task<Result<UsageSnapshot, Error>, Never>
+        let task: Task<RefreshOutcome, Never>
         let token: RefreshToken
         if let inFlight = refreshTask,
            let inFlightToken = activeRefreshToken,
@@ -99,16 +113,33 @@ final class UsageViewModel: ObservableObject {
         } else {
             let client = self.client
             isRefreshing = true
-            refreshFeedback = "正在获取最新额度…"
+            refreshFeedback = "正在获取最新数据…"
             let parser = self.parser
+            let tokenParser = self.tokenParser
+            let tokenUsageEnabled = self.tokenUsageEnabled
             let now = self.now
-            let created = Task<Result<UsageSnapshot, Error>, Never> {
+            let created = Task<RefreshOutcome, Never> {
+                let quota: Result<UsageSnapshot, Error>
                 do {
                     let response = try await client.fetchRateLimits()
-                    return Result.success(try parser.parse(response, now: now()))
+                    quota = .success(try parser.parse(response, now: now()))
                 } catch {
-                    return Result.failure(error)
+                    quota = .failure(error)
                 }
+
+                let tokenUsage: Result<DailyTokenUsage, Error>?
+                if tokenUsageEnabled {
+                    do {
+                        let response = try await client.fetchAccountUsage()
+                        tokenUsage = .success(try tokenParser.parse(response, now: now()))
+                    } catch {
+                        tokenUsage = .failure(error)
+                    }
+                } else {
+                    tokenUsage = nil
+                }
+
+                return RefreshOutcome(quota: quota, tokenUsage: tokenUsage)
             }
             nextRefreshGeneration += 1
             let createdToken = RefreshToken(
@@ -122,7 +153,7 @@ final class UsageViewModel: ObservableObject {
             token = createdToken
         }
 
-        let result = await task.value
+        let outcome = await task.value
         if activeRefreshToken == token {
             isRefreshing = false
             refreshTask = nil
@@ -132,18 +163,47 @@ final class UsageViewModel: ObservableObject {
               token.lifecycle == lifecycleEpoch,
               latestValidRefreshToken == token else { return }
 
-        switch result {
+        let quotaSucceeded: Bool
+        switch outcome.quota {
         case let .success(snapshot):
+            quotaSucceeded = true
             lastGoodSnapshot = snapshot
             store.save(snapshot)
             state = .current(snapshot)
-            refreshFeedback = "已刷新 · " + snapshot.fetchedAt.formatted(date: .omitted, time: .standard)
         case let .failure(error):
-            refreshFeedback = "刷新失败，请重试"
+            quotaSucceeded = false
             publishFailure(error)
             if isRunning, isConnectionFailure(error) {
                 requestReconnect()
             }
+        }
+
+        let tokenSucceeded: Bool?
+        switch outcome.tokenUsage {
+        case let .success(tokenUsage)?:
+            tokenSucceeded = true
+            lastGoodTokenUsage = tokenUsage
+            tokenState = .current(tokenUsage)
+        case let .failure(error)?:
+            tokenSucceeded = false
+            publishTokenFailure(error)
+            if isRunning, isConnectionFailure(error) {
+                requestReconnect()
+            }
+        case nil:
+            tokenSucceeded = nil
+        }
+
+        switch (quotaSucceeded, tokenSucceeded) {
+        case (true, true), (true, nil):
+            let refreshedAt = lastGoodSnapshot?.fetchedAt ?? now()
+            refreshFeedback = "已刷新 · " + refreshedAt.formatted(date: .omitted, time: .standard)
+        case (true, false):
+            refreshFeedback = "额度已刷新，Token 暂不可用"
+        case (false, true):
+            refreshFeedback = "Token 已刷新，额度暂不可用"
+        case (false, false), (false, nil):
+            refreshFeedback = "刷新失败，请重试"
         }
     }
 
@@ -244,6 +304,15 @@ final class UsageViewModel: ObservableObject {
             state = .stale(snapshot, message)
         } else {
             state = .unavailable(message)
+        }
+    }
+
+    private func publishTokenFailure(_ error: Error) {
+        let message = error.localizedDescription
+        if let tokenUsage = lastGoodTokenUsage {
+            tokenState = .stale(tokenUsage, message)
+        } else {
+            tokenState = .unavailable(message)
         }
     }
 

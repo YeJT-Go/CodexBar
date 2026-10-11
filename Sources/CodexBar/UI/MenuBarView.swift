@@ -1,10 +1,61 @@
 import AppKit
 import SwiftUI
 
+enum UsageColorToken: Equatable, Sendable {
+    case healthyGreen
+    case warningYellow
+    case criticalRed
+    case staleGray
+
+    static func make(for level: UsageLevel) -> Self {
+        switch level {
+        case .healthy:
+            return .healthyGreen
+        case .warning:
+            return .warningYellow
+        case .critical:
+            return .criticalRed
+        case .stale:
+            return .staleGray
+        }
+    }
+}
+
 struct MenuBarWindowPresentation: Equatable, Sendable {
     let title: String
     let remainingText: String
+    let remainingPercent: Int?
     let resetText: String
+}
+
+struct TokenUsagePresentation: Equatable, Sendable {
+    let valueText: String
+    let warningText: String?
+
+    static func make(
+        from state: TokenUsageState,
+        locale: Locale = .current
+    ) -> Self {
+        switch state {
+        case .loading:
+            return .init(valueText: "--", warningText: nil)
+        case let .current(usage):
+            return .init(valueText: formattedValue(usage.tokens, locale: locale), warningText: nil)
+        case let .stale(usage, message):
+            return .init(valueText: formattedValue(usage.tokens, locale: locale), warningText: message)
+        case let .unavailable(message):
+            return .init(valueText: "--", warningText: message)
+        }
+    }
+
+    private static func formattedValue(_ tokens: Int64, locale: Locale) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        let number = formatter.string(from: NSNumber(value: tokens)) ?? String(tokens)
+        return "\(number) tokens"
+    }
 }
 
 struct MenuBarPresentation: Equatable, Sendable {
@@ -79,7 +130,12 @@ struct MenuBarPresentation: Equatable, Sendable {
         Self(
             label: label,
             fiveHour: nil,
-            weekly: .init(title: "每周", remainingText: "--", resetText: "未知"),
+            weekly: .init(
+                title: "每周",
+                remainingText: "--",
+                remainingPercent: nil,
+                resetText: "未知"
+            ),
             fiveHourLevel: .stale,
             weeklyLevel: .stale,
             connectionText: connectionText,
@@ -92,6 +148,7 @@ struct MenuBarPresentation: Equatable, Sendable {
         .init(
             title: title,
             remainingText: "\(value.remainingPercent)%",
+            remainingPercent: value.remainingPercent,
             resetText: value.resetsAt?.formatted(date: .abbreviated, time: .shortened) ?? "未知"
         )
     }
@@ -120,19 +177,21 @@ struct MenuBarLabel: View {
     }
 
     private var labelContent: some View {
-        HStack(spacing: 5) {
+        let accentColor = UsageColorToken.make(for: presentation.accentLevel).color
+
+        return HStack(spacing: 5) {
             if presentation.showsWarning {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .accessibilityLabel("用量数据异常")
             }
             Circle()
-                .fill(presentation.accentLevel.color)
+                .fill(accentColor)
                 .frame(width: 6, height: 6)
             Text(presentation.label.replacingOccurrences(of: "⚠ ", with: ""))
                 .monospacedDigit()
         }
         .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(presentation.accentLevel.color)
+        .foregroundStyle(accentColor)
     }
 }
 
@@ -153,113 +212,153 @@ struct MenuBarView: View {
 
     var body: some View {
         let presentation = MenuBarPresentation.make(from: model.state)
+        let accentColor = UsageColorToken.make(for: presentation.accentLevel).color
 
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                if let fiveHour = presentation.fiveHour {
-                    UsageCard(value: fiveHour, level: presentation.fiveHourLevel)
-                }
-                UsageCard(value: presentation.weekly, level: presentation.weeklyLevel)
-            }
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("CodexBar")
+                        .font(.headline)
 
-            Divider()
-
-            Label(presentation.connectionText, systemImage: presentation.showsWarning
-                  ? "exclamationmark.triangle.fill" : "bolt.horizontal.circle")
-                .foregroundStyle(presentation.showsWarning ? Color.secondary : Color.primary)
-
-            if let warning = presentation.warningText {
-                Text(warning)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(accentColor)
+                            .frame(width: 7, height: 7)
+                        Text(model.refreshFeedback ?? presentation.connectionText)
+                            .lineLimit(2)
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                HStack(spacing: 8) {
-                    if model.isRefreshing {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    Text(model.isRefreshing ? "正在刷新…" : "立即刷新")
-                    Spacer()
                 }
-                .padding(.vertical, 4)
+                Spacer(minLength: 0)
+
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isRefreshing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text(model.isRefreshing ? "刷新中…" : "刷新")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.isRefreshing)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(presentation.accentLevel.color)
-            .disabled(model.isRefreshing)
 
-            Text(model.refreshFeedback ?? "等待刷新")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Toggle("登录时自动启动", isOn: Binding(
-                get: { loginItem.isEnabled },
-                set: { loginItem.setEnabled($0) }
-            ))
-
-            if let error = loginItem.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
+            VStack(alignment: .leading, spacing: 16) {
+                Text("剩余额度")
                     .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.secondary)
+                if let fiveHour = presentation.fiveHour {
+                    QuotaRow(
+                        value: fiveHour,
+                        level: presentation.fiveHourLevel,
+                        isPrimary: true
+                    )
+                    Divider()
+                }
+                QuotaRow(
+                    value: presentation.weekly,
+                    level: presentation.weeklyLevel,
+                    isPrimary: presentation.fiveHour == nil
+                )
+            }
+
+            if let warning = presentation.warningText {
+                InlineWarning(text: warning)
             }
 
             Divider()
 
-            Button("退出 CodexBar") {
-                Task { await lifecycle.quit() }
+            HStack(spacing: 16) {
+                Toggle("登录时自动启动", isOn: Binding(
+                    get: { loginItem.isEnabled },
+                    set: { loginItem.setEnabled($0) }
+                ))
+                Spacer(minLength: 0)
+                Button("退出 CodexBar") {
+                    Task { await lifecycle.quit() }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .keyboardShortcut("q")
             }
-            .buttonStyle(.plain)
-            .keyboardShortcut("q")
+
+            if let error = loginItem.errorMessage {
+                InlineWarning(text: error, color: .red)
+            }
         }
-        .padding(16)
-        .frame(width: 330)
-        .background(presentation.accentLevel.color.opacity(0.10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(presentation.accentLevel.color.opacity(0.35), lineWidth: 1)
-                .allowsHitTesting(false)
-        }
+        .padding(18)
+        .frame(width: 350)
         .onAppear { loginItem.synchronize() }
     }
 }
 
-private struct UsageCard: View {
+private struct QuotaRow: View {
     let value: MenuBarWindowPresentation
     let level: UsageLevel
+    let isPrimary: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(value.title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value.remainingText)
-                .font(.system(size: 28, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(level.color)
+        let accentColor = UsageColorToken.make(for: level).color
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(value.title)
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text(value.remainingText)
+                    .font(.system(
+                        size: isPrimary ? 32 : 26,
+                        weight: .semibold,
+                        design: .rounded
+                    ))
+                    .monospacedDigit()
+                    .foregroundStyle(accentColor)
+            }
+
+            ProgressView(value: Double(value.remainingPercent ?? 0), total: 100)
+                .progressViewStyle(.linear)
+                .tint(accentColor)
+                .accessibilityLabel("\(value.title)剩余额度")
+                .accessibilityValue(value.remainingText)
+
             Text("重置：\(value.resetText)")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
-private extension UsageLevel {
+private struct InlineWarning: View {
+    let text: String
+    var color: Color = .secondary
+
+    var body: some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+extension UsageColorToken {
     var color: Color {
         switch self {
-        case .healthy: .green
-        case .warning: .orange
-        case .critical: .red
-        case .stale: .gray
+        case .healthyGreen:
+            Color(.sRGB, red: 30.0 / 255.0, green: 133.0 / 255.0, blue: 91.0 / 255.0, opacity: 1)
+        case .warningYellow:
+            Color(.sRGB, red: 155.0 / 255.0, green: 120.0 / 255.0, blue: 0, opacity: 1)
+        case .criticalRed:
+            Color(.sRGB, red: 193.0 / 255.0, green: 81.0 / 255.0, blue: 77.0 / 255.0, opacity: 1)
+        case .staleGray:
+            Color(.sRGB, red: 118.0 / 255.0, green: 118.0 / 255.0, blue: 118.0 / 255.0, opacity: 1)
         }
     }
 }

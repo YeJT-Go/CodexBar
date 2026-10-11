@@ -1,7 +1,102 @@
 import XCTest
+import SwiftUI
 @testable import CodexBar
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testQuotaPaletteMapsLevelsToExpectedOpaqueSRGBColors() {
+        let expected: [(UsageLevel, Int, Int, Int)] = [
+            (.healthy, 30, 133, 91),
+            (.warning, 155, 120, 0),
+            (.critical, 193, 81, 77),
+            (.stale, 118, 118, 118),
+        ]
+
+        for (level, red, green, blue) in expected {
+            let value = UsageColorToken.make(for: level).color.resolve(in: EnvironmentValues())
+            XCTAssertEqual(Double(value.red), Double(red) / 255.0, accuracy: 0.001, "\(level) red")
+            XCTAssertEqual(Double(value.green), Double(green) / 255.0, accuracy: 0.001, "\(level) green")
+            XCTAssertEqual(Double(value.blue), Double(blue) / 255.0, accuracy: 0.001, "\(level) blue")
+            XCTAssertEqual(value.opacity, 1, accuracy: 0.001, "\(level) opacity")
+        }
+    }
+
+    func testQuotaAccentRGBMatchesAcrossLightAndDarkSchemes() {
+        var light = EnvironmentValues()
+        light.colorScheme = .light
+        var dark = EnvironmentValues()
+        dark.colorScheme = .dark
+
+        for level in [UsageLevel.healthy, .warning, .critical, .stale] {
+            let color = UsageColorToken.make(for: level).color
+            let lightValue = color.resolve(in: light)
+            let darkValue = color.resolve(in: dark)
+
+            XCTAssertEqual(lightValue.red, darkValue.red, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.green, darkValue.green, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.blue, darkValue.blue, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.opacity, darkValue.opacity, accuracy: 0.001, "\(level)")
+        }
+    }
+
+    func testQuotaAccentContrastsWithPureBlackAndWhiteAtLevelMinimum() {
+        for level in [UsageLevel.healthy, .warning, .critical, .stale] {
+            let value = UsageColorToken.make(for: level).color.resolve(in: EnvironmentValues())
+            let luminance = 0.2126 * Double(value.linearRed)
+                + 0.7152 * Double(value.linearGreen)
+                + 0.0722 * Double(value.linearBlue)
+            // User-selected warning yellow is brighter; it does not guarantee 4.5:1 for small text.
+            let minimumContrast = level == .warning ? 3.0 : 4.5
+            XCTAssertGreaterThanOrEqual(1.05 / (luminance + 0.05), minimumContrast, "\(level) on light")
+            XCTAssertGreaterThanOrEqual((luminance + 0.05) / 0.05, minimumContrast, "\(level) on dark")
+        }
+    }
+
+    func testTokenPresentationFormatsCurrentValueWithGrouping() {
+        let usage = DailyTokenUsage(
+            tokens: 184_260,
+            dateKey: "2026-09-11",
+            fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
+        )
+
+        let value = TokenUsagePresentation.make(
+            from: .current(usage),
+            locale: Locale(identifier: "en_US")
+        )
+
+        XCTAssertEqual(value.valueText, "184,260 tokens")
+        XCTAssertNil(value.warningText)
+    }
+
+    func testTokenPresentationKeepsLastValueAndWarningWhenStale() {
+        let usage = DailyTokenUsage(
+            tokens: 64_000,
+            dateKey: "2026-09-11",
+            fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
+        )
+
+        let value = TokenUsagePresentation.make(
+            from: .stale(usage, "Token 数据已过期"),
+            locale: Locale(identifier: "en_US")
+        )
+
+        XCTAssertEqual(value.valueText, "64,000 tokens")
+        XCTAssertEqual(value.warningText, "Token 数据已过期")
+    }
+
+    func testTokenPresentationShowsPlaceholderWhileLoading() {
+        let value = TokenUsagePresentation.make(from: .loading)
+
+        XCTAssertEqual(value.valueText, "--")
+        XCTAssertNil(value.warningText)
+    }
+
+    func testTokenPresentationDoesNotInventZeroForUnavailableData() {
+        let value = TokenUsagePresentation.make(from: .unavailable("响应缺少字段"))
+
+        XCTAssertEqual(value.valueText, "--")
+        XCTAssertEqual(value.warningText, "响应缺少字段")
+    }
+
     func testCurrentPresentationContainsBothWindowsAndSemanticLevels() {
         let snapshot = UsageSnapshot(
             fiveHour: .init(remainingPercent: 80, resetsAt: nil),
@@ -21,10 +116,10 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertFalse(value.showsWarning)
     }
 
-    func testThresholdsUseHealthyAt50WarningAt20AndCriticalBelow20() {
+    func testThresholdsUseApprovedHealthyWarningAndCriticalBoundaries() {
         let snapshot = UsageSnapshot(
-            fiveHour: .init(remainingPercent: 50, resetsAt: nil),
-            weekly: .init(remainingPercent: 20, resetsAt: nil),
+            fiveHour: .init(remainingPercent: 51, resetsAt: nil),
+            weekly: .init(remainingPercent: 21, resetsAt: nil),
             fetchedAt: Date(timeIntervalSince1970: 1_788_700_000)
         )
 
@@ -33,13 +128,13 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertEqual(value.fiveHourLevel, .healthy)
         XCTAssertEqual(value.weeklyLevel, .warning)
 
-        let critical = MenuBarPresentation.make(from: .current(.init(
-            fiveHour: .init(remainingPercent: 19, resetsAt: nil),
-            weekly: .init(remainingPercent: 0, resetsAt: nil),
+        let boundaries = MenuBarPresentation.make(from: .current(.init(
+            fiveHour: .init(remainingPercent: 50, resetsAt: nil),
+            weekly: .init(remainingPercent: 20, resetsAt: nil),
             fetchedAt: snapshot.fetchedAt
         )))
-        XCTAssertEqual(critical.fiveHourLevel, .critical)
-        XCTAssertEqual(critical.weeklyLevel, .critical)
+        XCTAssertEqual(boundaries.fiveHourLevel, .warning)
+        XCTAssertEqual(boundaries.weeklyLevel, .critical)
     }
 
     func testStalePresentationKeepsValuesButUsesGrayAndWarningText() {

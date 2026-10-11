@@ -14,9 +14,10 @@ final class RateLimitParserTests: XCTestCase {
     }
 
     func testClampsAndColorsRemainingPercent() {
-        XCTAssertEqual(UsageLevel.level(forRemaining: 50), .healthy)
-        XCTAssertEqual(UsageLevel.level(forRemaining: 49), .warning)
-        XCTAssertEqual(UsageLevel.level(forRemaining: 19), .critical)
+        XCTAssertEqual(UsageLevel.level(forRemaining: 51), .healthy)
+        XCTAssertEqual(UsageLevel.level(forRemaining: 50), .warning)
+        XCTAssertEqual(UsageLevel.level(forRemaining: 21), .warning)
+        XCTAssertEqual(UsageLevel.level(forRemaining: 20), .critical)
         XCTAssertEqual(UsageWindow.remaining(fromUsed: 130), 0)
         XCTAssertEqual(UsageWindow.remaining(fromUsed: -10), 100)
     }

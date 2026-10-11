@@ -5,6 +5,7 @@ struct CodexBarApp: App {
     @NSApplicationDelegateAdaptor(CodexBarApplicationDelegate.self) private var appDelegate
     @StateObject private var model: UsageViewModel
     @StateObject private var lifecycle: AppLifecycleCoordinator
+    private let floatingQuotaCardController: FloatingQuotaCardController
 
     init() {
         let model = AppDependencies.makeUsageViewModel()
@@ -13,6 +14,7 @@ struct CodexBarApp: App {
             usage: model,
             terminator: ApplicationTerminator()
         ))
+        floatingQuotaCardController = FloatingQuotaCardController(model: model)
     }
 
     var body: some Scene {
@@ -27,6 +29,7 @@ struct CodexBarApp: App {
                 .task {
                     appDelegate.lifecycle = lifecycle
                     lifecycle.start()
+                    floatingQuotaCardController.start()
                 }
         }
         .menuBarExtraStyle(.window)
@@ -58,6 +61,7 @@ private struct UnavailableUsageProvider: CodexUsageProviding {
 
     func connect() async throws { throw StartupError(message: message) }
     func fetchRateLimits() async throws -> RateLimitsResponse { throw StartupError(message: message) }
+    func fetchAccountUsage() async throws -> AccountTokenUsageResponse { throw StartupError(message: message) }
     func updates() -> AsyncStream<RateLimitsResponse> { AsyncStream { $0.finish() } }
     func stop() async {}
 }

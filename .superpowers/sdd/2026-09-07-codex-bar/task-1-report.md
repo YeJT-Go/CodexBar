@@ -54,3 +54,25 @@
 ### Fix round 1 结论
 
 测试覆盖已按审查意见补齐；由于当前环境要求交互式接受 Xcode 许可证，无法取得测试通过输出。该环境问题不能由代码修复。
+
+## 验证补充（Xcode 许可证已由环境准备完成）
+
+为避免修改系统配置，使用现有 Xcode 和临时缓存路径运行：
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/codexbar-swiftpm-cache \
+CLANG_MODULE_CACHE_PATH=/tmp/codexbar-clang-cache \
+swift test --filter RateLimitParserTests
+```
+
+结果：`Executed 5 tests, with 0 failures`；测试套件通过，构建完成。
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/codexbar-swiftpm-cache \
+CLANG_MODULE_CACHE_PATH=/tmp/codexbar-clang-cache \
+swift test
+```
+
+结果：`Executed 5 tests, with 0 failures`；`All tests` 测试套件通过，构建完成。期间未安装系统组件、未修改 `xcode-select` 或其他系统配置。

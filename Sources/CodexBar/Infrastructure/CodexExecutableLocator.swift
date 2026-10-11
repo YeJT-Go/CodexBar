@@ -3,6 +3,7 @@ import Foundation
 enum CodexClientError: Error, Equatable, Sendable {
     case executableNotFound
     case malformedRateLimitsResponse
+    case malformedAccountUsageResponse
     case serverExited(code: Int32, stderr: String)
     case stopped
 }

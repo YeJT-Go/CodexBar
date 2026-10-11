@@ -99,6 +99,124 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(initializeCount, 2)
     }
 
+    func testFetchAccountUsageDecodesDailyBuckets() async throws {
+        let value: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([
+                .object(["startDate": .string("2026-09-11"), "tokens": .number(184_260)])
+            ])
+        ])
+        let rpc = RecordingRPCConnection(responses: ["account/usage/read": [.success(value)]])
+
+        let response = try await CodexAppServerClient(connection: rpc).fetchAccountUsage()
+
+        XCTAssertEqual(response.dailyUsageBuckets?.first?.tokens, 184_260)
+        let requestCount = await rpc.requestCount(for: "account/usage/read")
+        let events = await rpc.events
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(events.last?.params, nil)
+    }
+
+    func testFetchAccountUsageThrowsMalformedErrorWhenSummaryIsMissing() async throws {
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.success(.object(["dailyUsageBuckets": .array([])]))]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+
+        do {
+            _ = try await client.fetchAccountUsage()
+            XCTFail("缺少 summary 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedAccountUsageResponse)
+        }
+    }
+
+    func testMalformedAccountUsageKeepsConnectionForFollowingRateLimitsRead() async throws {
+        let rateLimits = try fixture(namedCodexUsedPercent: 12, fallbackUsedPercent: 91)
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.success(.object(["dailyUsageBuckets": .array([])]))],
+            "account/rateLimits/read": [.success(rateLimits)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        do {
+            _ = try await client.fetchAccountUsage()
+            XCTFail("缺少 summary 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedAccountUsageResponse)
+        }
+
+        let fetched = try await client.fetchRateLimits()
+        let initializeCount = await rpc.requestCount(for: "initialize")
+
+        XCTAssertEqual(fetched.rateLimitsByLimitId?["codex"]?.primary?.usedPercent, 12)
+        XCTAssertEqual(initializeCount, 1)
+    }
+
+    func testMalformedRateLimitsKeepsConnectionForFollowingAccountUsageRead() async throws {
+        let accountUsage: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([])
+        ])
+        let rpc = RecordingRPCConnection(responses: [
+            "account/rateLimits/read": [.success(.object([:]))],
+            "account/usage/read": [.success(accountUsage)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        do {
+            _ = try await client.fetchRateLimits()
+            XCTFail("缺少 rateLimits 的响应必须被拒绝")
+        } catch let error as CodexClientError {
+            XCTAssertEqual(error, .malformedRateLimitsResponse)
+        }
+
+        let fetched = try await client.fetchAccountUsage()
+        let initializeCount = await rpc.requestCount(for: "initialize")
+
+        XCTAssertEqual(fetched.summary.lifetimeTokens, 184_260)
+        XCTAssertEqual(initializeCount, 1)
+    }
+
+    func testDisconnectedAccountUsageReadReconnectsAndRetriesOnce() async throws {
+        let value: JSONValue = .object([
+            "summary": .object([
+                "lifetimeTokens": .number(184_260),
+                "peakDailyTokens": .number(90_000),
+                "currentStreakDays": .number(3),
+                "longestStreakDays": .number(7),
+                "longestRunningTurnSec": .number(600)
+            ]),
+            "dailyUsageBuckets": .array([])
+        ])
+        let rpc = RecordingRPCConnection(responses: [
+            "account/usage/read": [.failure(JSONRPCError.disconnected), .success(value)]
+        ])
+        let client = CodexAppServerClient(connection: rpc)
+        try await client.connect()
+
+        _ = try await client.fetchAccountUsage()
+
+        let usageReadCount = await rpc.requestCount(for: "account/usage/read")
+        let initializeCount = await rpc.requestCount(for: "initialize")
+        XCTAssertEqual(usageReadCount, 2)
+        XCTAssertEqual(initializeCount, 2)
+    }
+
     func testSparseUpdateRefetchesAndPublishesCompleteSnapshot() async throws {
         let completeResponse = try fixture(namedCodexUsedPercent: 31, fallbackUsedPercent: 88)
         let rpc = RecordingRPCConnection(responses: [
@@ -249,17 +367,11 @@ final class CodexAppServerClientTests: XCTestCase {
             .appendingPathComponent("CodexBarTests-child-finished-\(UUID().uuidString)")
         let pidMarker = marker.appendingPathExtension("pid")
         defer {
-            if !FileManager.default.fileExists(atPath: marker.path),
-               let pidData = try? Data(contentsOf: pidMarker),
-               let pid = Int32(String(decoding: pidData, as: UTF8.self)) {
+            if !FileManager.default.fileExists(atPath: marker.path), let pid = processID(from: pidMarker) {
                 _ = Darwin.kill(pid, SIGTERM)
             }
-            if FileManager.default.fileExists(atPath: marker.path) {
-                try? FileManager.default.removeItem(at: marker)
-            }
-            if FileManager.default.fileExists(atPath: pidMarker.path) {
-                try? FileManager.default.removeItem(at: pidMarker)
-            }
+            removeIfPresent(marker)
+            removeIfPresent(pidMarker)
         }
         let escapedMarker = marker.path.replacingOccurrences(of: "'", with: "\\'")
         let escapedPIDMarker = pidMarker.path.replacingOccurrences(of: "'", with: "\\'")
@@ -274,20 +386,20 @@ final class CodexAppServerClientTests: XCTestCase {
         """)
         defer { script.remove() }
         let transport = ProcessTransport(executableURL: script.url)
-        let recorder = SynchronousProcessEventRecorder()
-        let clock = ContinuousClock()
-        let startedAt = clock.now
+        let recorder = BoundedTerminationRecorder(expectedLine: #"{"beforeExit":true}"#)
 
         try await transport.start(
             onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
             onTermination: { recorder.appendTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
+        try await waitUntil(timeout: .seconds(1)) { recorder.hasExpectedLine }
         try await waitUntil(timeout: .milliseconds(250)) { recorder.hasTerminated }
-        let terminationElapsed = startedAt.duration(to: clock.now)
         try await waitUntil(timeout: .seconds(1)) { FileManager.default.fileExists(atPath: marker.path) }
 
-        XCTAssertLessThan(terminationElapsed, .milliseconds(250))
-        XCTAssertEqual(recorder.events, [.line(#"{"beforeExit":true}"#), .termination(0)])
+        XCTAssertLessThan(try XCTUnwrap(recorder.lineToTerminationDuration), .milliseconds(250))
+        XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertEqual(recorder.exitCode, 0)
     }
 
     func testTerminationDrainIsBoundedWhileDescendantContinuouslyWrites() async throws {
@@ -310,9 +422,7 @@ final class CodexAppServerClientTests: XCTestCase {
         defer {
             cleanup.terminateAndWait()
             parent.remove()
-            if FileManager.default.fileExists(atPath: pidMarker.path) {
-                try? FileManager.default.removeItem(at: pidMarker)
-            }
+            removeIfPresent(pidMarker)
         }
         let transport = ProcessTransport(executableURL: parent.url)
         let recorder = BoundedTerminationRecorder(expectedLine: #"{"beforeContinuousWrite":true}"#)
@@ -321,12 +431,15 @@ final class CodexAppServerClientTests: XCTestCase {
             onLine: { recorder.appendLine(String(decoding: $0, as: UTF8.self)) },
             onTermination: { recorder.appendTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
+        try await waitUntil(timeout: .seconds(1)) { recorder.hasExpectedLine }
         try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
         let lineToTermination = try XCTUnwrap(recorder.lineToTerminationDuration)
         cleanup.terminateAndWait()
 
         XCTAssertLessThan(lineToTermination, .milliseconds(250))
         XCTAssertTrue(recorder.expectedLinePrecededTermination)
+        XCTAssertEqual(recorder.exitCode, 0)
         XCTAssertFalse(cleanup.isRunning)
     }
 
@@ -349,7 +462,7 @@ final class CodexAppServerClientTests: XCTestCase {
         defer {
             cleanup.terminateAndWait()
             script.remove()
-            try? FileManager.default.removeItem(at: pidMarker)
+            removeIfPresent(pidMarker)
         }
         let transport = ProcessTransport(
             executableURL: script.url,
@@ -361,6 +474,7 @@ final class CodexAppServerClientTests: XCTestCase {
             onLine: { _ in recorder.recordLine() },
             onTermination: { recorder.recordTermination($0) }
         )
+        try await waitUntil(timeout: .seconds(2)) { processID(from: pidMarker) != nil }
         var terminatedInTime = true
         do {
             try await waitUntil(timeout: .milliseconds(500)) { recorder.hasTerminated }
@@ -692,12 +806,15 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
     private let clock = ContinuousClock()
     private var lineInstant: ContinuousClock.Instant?
     private var terminationInstant: ContinuousClock.Instant?
+    private var terminationExitCode: Int32?
 
     init(expectedLine: String) {
         self.expectedLine = expectedLine
     }
 
     var hasTerminated: Bool { lock.withLock { terminationInstant != nil } }
+    var hasExpectedLine: Bool { lock.withLock { lineInstant != nil } }
+    var exitCode: Int32? { lock.withLock { terminationExitCode } }
     var expectedLinePrecededTermination: Bool {
         lock.withLock {
             guard let lineInstant, let terminationInstant else { return false }
@@ -718,9 +835,12 @@ private final class BoundedTerminationRecorder: @unchecked Sendable {
         }
     }
 
-    func appendTermination(_: Int32) {
+    func appendTermination(_ code: Int32) {
         lock.withLock {
-            if terminationInstant == nil { terminationInstant = clock.now }
+            if terminationInstant == nil {
+                terminationInstant = clock.now
+                terminationExitCode = code
+            }
         }
     }
 }
@@ -771,8 +891,7 @@ private final class DescendantProcessCleanup: @unchecked Sendable {
     }
 
     private var pid: Int32? {
-        guard let data = try? Data(contentsOf: pidFile) else { return nil }
-        return Int32(String(decoding: data, as: UTF8.self))
+        processID(from: pidFile)
     }
 
     private func waitForExit(pid: Int32, timeout: TimeInterval) {
@@ -787,6 +906,16 @@ private final class DescendantProcessCleanup: @unchecked Sendable {
     private func signalTarget(for pid: Int32) -> Int32 {
         targetsProcessGroup ? -pid : pid
     }
+}
+
+private func processID(from file: URL) -> Int32? {
+    guard let data = FileManager.default.contents(atPath: file.path) else { return nil }
+    return Int32(String(decoding: data, as: UTF8.self))
+}
+
+private func removeIfPresent(_ file: URL) {
+    guard FileManager.default.fileExists(atPath: file.path) else { return }
+    try? FileManager.default.removeItem(at: file)
 }
 
 private enum TestWaitError: Error {

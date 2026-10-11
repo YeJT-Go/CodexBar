@@ -39,6 +39,6 @@ enum UsageLevel: Equatable, Sendable {
     case stale
 
     static func level(forRemaining value: Int) -> Self {
-        value >= 50 ? .healthy : value >= 20 ? .warning : .critical
+        value > 50 ? .healthy : value > 20 ? .warning : .critical
     }
 }
