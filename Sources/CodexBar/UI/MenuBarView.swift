@@ -1,32 +1,22 @@
 import AppKit
 import SwiftUI
 
-enum UsageAppearance: Equatable, Sendable {
-    case light
-    case dark
-
-    init(colorScheme: ColorScheme) {
-        self = colorScheme == .dark ? .dark : .light
-    }
-}
-
 enum UsageColorToken: Equatable, Sendable {
-    case systemGreen
-    case deepGold
-    case systemYellow
-    case systemRed
-    case systemGray
+    case healthyGreen
+    case warningYellow
+    case criticalRed
+    case staleGray
 
-    static func make(for level: UsageLevel, appearance: UsageAppearance) -> Self {
+    static func make(for level: UsageLevel) -> Self {
         switch level {
         case .healthy:
-            return .systemGreen
+            return .healthyGreen
         case .warning:
-            return appearance == .light ? .deepGold : .systemYellow
+            return .warningYellow
         case .critical:
-            return .systemRed
+            return .criticalRed
         case .stale:
-            return .systemGray
+            return .staleGray
         }
     }
 }
@@ -166,7 +156,6 @@ struct MenuBarPresentation: Equatable, Sendable {
 
 struct MenuBarLabel: View {
     let presentation: MenuBarPresentation
-    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         // A non-template image preserves quota colors in the macOS status bar.
@@ -188,10 +177,7 @@ struct MenuBarLabel: View {
     }
 
     private var labelContent: some View {
-        let accentColor = UsageColorToken.make(
-            for: presentation.accentLevel,
-            appearance: UsageAppearance(colorScheme: colorScheme)
-        ).color
+        let accentColor = UsageColorToken.make(for: presentation.accentLevel).color
 
         return HStack(spacing: 5) {
             if presentation.showsWarning {
@@ -212,7 +198,6 @@ struct MenuBarLabel: View {
 struct MenuBarView: View {
     @ObservedObject var model: UsageViewModel
     @StateObject private var loginItem: LoginItemController
-    @Environment(\.colorScheme) private var colorScheme
     let lifecycle: AppLifecycleCoordinator
 
     init(
@@ -227,11 +212,7 @@ struct MenuBarView: View {
 
     var body: some View {
         let presentation = MenuBarPresentation.make(from: model.state)
-        let appearance = UsageAppearance(colorScheme: colorScheme)
-        let accentColor = UsageColorToken.make(
-            for: presentation.accentLevel,
-            appearance: appearance
-        ).color
+        let accentColor = UsageColorToken.make(for: presentation.accentLevel).color
 
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 16) {
@@ -277,7 +258,6 @@ struct MenuBarView: View {
                     QuotaRow(
                         value: fiveHour,
                         level: presentation.fiveHourLevel,
-                        appearance: appearance,
                         isPrimary: true
                     )
                     Divider()
@@ -285,7 +265,6 @@ struct MenuBarView: View {
                 QuotaRow(
                     value: presentation.weekly,
                     level: presentation.weeklyLevel,
-                    appearance: appearance,
                     isPrimary: presentation.fiveHour == nil
                 )
             }
@@ -323,11 +302,10 @@ struct MenuBarView: View {
 private struct QuotaRow: View {
     let value: MenuBarWindowPresentation
     let level: UsageLevel
-    let appearance: UsageAppearance
     let isPrimary: Bool
 
     var body: some View {
-        let accentColor = UsageColorToken.make(for: level, appearance: appearance).color
+        let accentColor = UsageColorToken.make(for: level).color
 
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
@@ -370,19 +348,17 @@ private struct InlineWarning: View {
     }
 }
 
-private extension UsageColorToken {
+extension UsageColorToken {
     var color: Color {
         switch self {
-        case .systemGreen:
-            .green
-        case .deepGold:
-            Color(red: 154 / 255, green: 103 / 255, blue: 0)
-        case .systemYellow:
-            .yellow
-        case .systemRed:
-            .red
-        case .systemGray:
-            .gray
+        case .healthyGreen:
+            Color(.sRGB, red: 30.0 / 255.0, green: 133.0 / 255.0, blue: 91.0 / 255.0, opacity: 1)
+        case .warningYellow:
+            Color(.sRGB, red: 155.0 / 255.0, green: 120.0 / 255.0, blue: 0, opacity: 1)
+        case .criticalRed:
+            Color(.sRGB, red: 193.0 / 255.0, green: 81.0 / 255.0, blue: 77.0 / 255.0, opacity: 1)
+        case .staleGray:
+            Color(.sRGB, red: 118.0 / 255.0, green: 118.0 / 255.0, blue: 118.0 / 255.0, opacity: 1)
         }
     }
 }

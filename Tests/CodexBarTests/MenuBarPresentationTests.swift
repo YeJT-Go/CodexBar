@@ -1,26 +1,53 @@
 import XCTest
+import SwiftUI
 @testable import CodexBar
 
 final class MenuBarPresentationTests: XCTestCase {
-    func testWarningColorTokenUsesDeepGoldInLightModeAndBrightYellowInDarkMode() {
-        XCTAssertEqual(
-            UsageColorToken.make(for: .warning, appearance: .light),
-            .deepGold
-        )
-        XCTAssertEqual(
-            UsageColorToken.make(for: .warning, appearance: .dark),
-            .systemYellow
-        )
+    func testQuotaPaletteMapsLevelsToExpectedOpaqueSRGBColors() {
+        let expected: [(UsageLevel, Int, Int, Int)] = [
+            (.healthy, 30, 133, 91),
+            (.warning, 155, 120, 0),
+            (.critical, 193, 81, 77),
+            (.stale, 118, 118, 118),
+        ]
+
+        for (level, red, green, blue) in expected {
+            let value = UsageColorToken.make(for: level).color.resolve(in: EnvironmentValues())
+            XCTAssertEqual(Double(value.red), Double(red) / 255.0, accuracy: 0.001, "\(level) red")
+            XCTAssertEqual(Double(value.green), Double(green) / 255.0, accuracy: 0.001, "\(level) green")
+            XCTAssertEqual(Double(value.blue), Double(blue) / 255.0, accuracy: 0.001, "\(level) blue")
+            XCTAssertEqual(value.opacity, 1, accuracy: 0.001, "\(level) opacity")
+        }
     }
 
-    func testNonWarningColorTokensRemainStableAcrossAppearances() {
-        for (level, expected) in [
-            (UsageLevel.healthy, UsageColorToken.systemGreen),
-            (.critical, .systemRed),
-            (.stale, .systemGray),
-        ] {
-            XCTAssertEqual(UsageColorToken.make(for: level, appearance: .light), expected)
-            XCTAssertEqual(UsageColorToken.make(for: level, appearance: .dark), expected)
+    func testQuotaAccentRGBMatchesAcrossLightAndDarkSchemes() {
+        var light = EnvironmentValues()
+        light.colorScheme = .light
+        var dark = EnvironmentValues()
+        dark.colorScheme = .dark
+
+        for level in [UsageLevel.healthy, .warning, .critical, .stale] {
+            let color = UsageColorToken.make(for: level).color
+            let lightValue = color.resolve(in: light)
+            let darkValue = color.resolve(in: dark)
+
+            XCTAssertEqual(lightValue.red, darkValue.red, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.green, darkValue.green, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.blue, darkValue.blue, accuracy: 0.001, "\(level)")
+            XCTAssertEqual(lightValue.opacity, darkValue.opacity, accuracy: 0.001, "\(level)")
+        }
+    }
+
+    func testQuotaAccentContrastsWithPureBlackAndWhiteAtLevelMinimum() {
+        for level in [UsageLevel.healthy, .warning, .critical, .stale] {
+            let value = UsageColorToken.make(for: level).color.resolve(in: EnvironmentValues())
+            let luminance = 0.2126 * Double(value.linearRed)
+                + 0.7152 * Double(value.linearGreen)
+                + 0.0722 * Double(value.linearBlue)
+            // User-selected warning yellow is brighter; it does not guarantee 4.5:1 for small text.
+            let minimumContrast = level == .warning ? 3.0 : 4.5
+            XCTAssertGreaterThanOrEqual(1.05 / (luminance + 0.05), minimumContrast, "\(level) on light")
+            XCTAssertGreaterThanOrEqual((luminance + 0.05) / 0.05, minimumContrast, "\(level) on dark")
         }
     }
 
